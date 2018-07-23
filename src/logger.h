@@ -18,9 +18,16 @@
 extern "C" {
 #endif
 
+//log time precision
 #define LOG_TIME_PRECISION_SECOND	's'  //second
 #define LOG_TIME_PRECISION_MSECOND	'm'  //millisecond
-#define LOG_TIME_PRECISION_USSECOND	'u'  //microsecond
+#define LOG_TIME_PRECISION_USECOND	'u'  //microsecond
+#define LOG_TIME_PRECISION_NONE 	'0'  //do NOT output timestamp
+
+//log compress flags
+#define LOG_COMPRESS_FLAGS_NONE       0
+#define LOG_COMPRESS_FLAGS_ENABLED    1
+#define LOG_COMPRESS_FLAGS_NEW_THREAD 2
 
 struct log_context;
 
@@ -70,6 +77,12 @@ typedef struct log_context
 	/* time precision */
 	char time_precision;
 
+    /* if use file write lock */
+    bool use_file_write_lock;
+
+    /* compress the log file use gzip command */
+    short compress_log_flags;
+
 	/* save the log filename */
 	char log_filename[MAX_PATH_SIZE];
 
@@ -88,6 +101,11 @@ typedef struct log_context
      * log the header (title line) callback
      * */
     LogHeaderCallback print_header_callback;
+
+    /*
+     * compress the log files before N days
+     * */
+    int compress_log_days_before;
 } LogContext;
 
 extern LogContext g_log_context;
@@ -114,6 +132,17 @@ int log_init2();
 
 #define log_take_over_stderr()  log_take_over_stderr_ex(&g_log_context)
 #define log_take_over_stdout()  log_take_over_stdout_ex(&g_log_context)
+
+#define log_set_compress_log_flags(flags) \
+    log_set_compress_log_flags_ex(&g_log_context, flags)
+#define log_set_compress_log_days_before(days_before) \
+    log_set_compress_log_days_before_ex(&g_log_context, days_before)
+
+#define log_set_use_file_write_lock(use_lock)  \
+    log_set_use_file_write_lock_ex(&g_log_context, use_lock)
+
+#define log_header(pContext, header, header_len) \
+    log_it_ex2(pContext, NULL, header, header_len, false, false)
 
 #define log_destroy()  log_destroy_ex(&g_log_context)
 
@@ -158,6 +187,14 @@ int log_set_filename_ex(LogContext *pContext, const char *log_filename);
 */
 void log_set_cache_ex(LogContext *pContext, const bool bLogCache);
 
+/** set if use file write lock
+ *  parameters:
+ *           pContext: the log context
+ *           use_lock: true for use write lock, false NOT use write lock
+ *  return: none
+*/
+void log_set_use_file_write_lock_ex(LogContext *pContext, const bool use_lock);
+
 /** set time precision
  *  parameters:
  *           pContext: the log context
@@ -191,14 +228,34 @@ void log_set_keep_days(LogContext *pContext, const int keep_days);
 void log_set_header_callback(LogContext *pContext, LogHeaderCallback header_callback);
 
 /** set take_over_stderr to true
+ *  parameters:
+ *           pContext: the log context
  *  return: none
 */
 void log_take_over_stderr_ex(LogContext *pContext);
 
 /** set take_over_stdout to true
+ *  parameters:
+ *           pContext: the log context
  *  return: none
 */
 void log_take_over_stdout_ex(LogContext *pContext);
+
+/** set compress_log_flags to true
+ *  parameters:
+ *           pContext: the log context
+ *           flags: the compress log flags
+ *  return: none
+*/
+void log_set_compress_log_flags_ex(LogContext *pContext, const short flags);
+
+/** set compress log file before N days
+ *  parameters:
+ *           pContext: the log context
+ *           days_before: compress log file before N days
+ *  return: none
+*/
+void log_set_compress_log_days_before_ex(LogContext *pContext, const int days_before);
 
 /** set log fd flags
  *  parameters:
@@ -225,7 +282,7 @@ void log_destroy_ex(LogContext *pContext);
  *  return: none
 */
 void log_it_ex(LogContext *pContext, const int priority, \
-		const char *format, ...);
+		const char *format, ...) __gcc_attribute__ ((format (printf, 3, 4)));
 
 /** log to file
  *  parameters:
@@ -281,16 +338,41 @@ int log_rotate(LogContext *pContext);
 */
 int log_delete_old_files(void *args);
 
-void logEmergEx(LogContext *pContext, const char *format, ...);
-void logCritEx(LogContext *pContext, const char *format, ...);
-void logAlertEx(LogContext *pContext, const char *format, ...);
-void logErrorEx(LogContext *pContext, const char *format, ...);
-void logWarningEx(LogContext *pContext, const char *format, ...);
-void logNoticeEx(LogContext *pContext, const char *format, ...);
-void logInfoEx(LogContext *pContext, const char *format, ...);
-void logDebugEx(LogContext *pContext, const char *format, ...);
-void logAccess(LogContext *pContext, struct timeval *tvStart, \
-		const char *format, ...);
+/** get log level caption
+ *  parameters:
+ *           pContext: the log context
+ *  return: log level caption
+*/
+const char *log_get_level_caption_ex(LogContext *pContext);
+
+#define log_get_level_caption() log_get_level_caption_ex(&g_log_context)
+
+void logEmergEx(LogContext *pContext, const char *format, ...)
+    __gcc_attribute__ ((format (printf, 2, 3)));
+
+void logCritEx(LogContext *pContext, const char *format, ...)
+    __gcc_attribute__ ((format (printf, 2, 3)));
+
+void logAlertEx(LogContext *pContext, const char *format, ...)
+    __gcc_attribute__ ((format (printf, 2, 3)));
+
+void logErrorEx(LogContext *pContext, const char *format, ...)
+    __gcc_attribute__ ((format (printf, 2, 3)));
+
+void logWarningEx(LogContext *pContext, const char *format, ...)
+    __gcc_attribute__ ((format (printf, 2, 3)));
+
+void logNoticeEx(LogContext *pContext, const char *format, ...)
+    __gcc_attribute__ ((format (printf, 2, 3)));
+
+void logInfoEx(LogContext *pContext, const char *format, ...)
+    __gcc_attribute__ ((format (printf, 2, 3)));
+
+void logDebugEx(LogContext *pContext, const char *format, ...)
+    __gcc_attribute__ ((format (printf, 2, 3)));
+
+void logAccess(LogContext *pContext, struct timeval *tvStart,
+        const char *format, ...) __gcc_attribute__ ((format (printf, 3, 4)));
 
 //#define LOG_FORMAT_CHECK
 
@@ -308,14 +390,29 @@ void logAccess(LogContext *pContext, struct timeval *tvStart, \
 #else
 
 /* following functions use global log context: g_log_context */
-void logEmerg(const char *format, ...);
-void logCrit(const char *format, ...);
-void logAlert(const char *format, ...);
-void logError(const char *format, ...);
-void logWarning(const char *format, ...);
-void logNotice(const char *format, ...);
-void logInfo(const char *format, ...);
-void logDebug(const char *format, ...);
+void logEmerg(const char *format, ...)
+    __gcc_attribute__ ((format (printf, 1, 2)));
+
+void logCrit(const char *format, ...)
+    __gcc_attribute__ ((format (printf, 1, 2)));
+
+void logAlert(const char *format, ...)
+    __gcc_attribute__ ((format (printf, 1, 2)));
+
+void logError(const char *format, ...)
+    __gcc_attribute__ ((format (printf, 1, 2)));
+
+void logWarning(const char *format, ...)
+    __gcc_attribute__ ((format (printf, 1, 2)));
+
+void logNotice(const char *format, ...)
+    __gcc_attribute__ ((format (printf, 1, 2)));
+
+void logInfo(const char *format, ...)
+    __gcc_attribute__ ((format (printf, 1, 2)));
+
+void logDebug(const char *format, ...)
+    __gcc_attribute__ ((format (printf, 1, 2)));
 
 #endif
 
@@ -324,4 +421,3 @@ void logDebug(const char *format, ...);
 #endif
 
 #endif
-

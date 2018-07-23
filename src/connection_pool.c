@@ -15,8 +15,9 @@
 #include "sched_thread.h"
 #include "connection_pool.h"
 
-int conn_pool_init(ConnectionPool *cp, int connect_timeout, \
-	const int max_count_per_entry, const int max_idle_time)
+int conn_pool_init_ex(ConnectionPool *cp, int connect_timeout, \
+	const int max_count_per_entry, const int max_idle_time,
+    const int socket_domain)
 {
 	int result;
 
@@ -27,8 +28,17 @@ int conn_pool_init(ConnectionPool *cp, int connect_timeout, \
 	cp->connect_timeout = connect_timeout;
 	cp->max_count_per_entry = max_count_per_entry;
 	cp->max_idle_time = max_idle_time;
+	cp->socket_domain = socket_domain;
 
 	return hash_init(&(cp->hash_array), simple_hash, 1024, 0.75);
+}
+
+int conn_pool_init(ConnectionPool *cp, int connect_timeout,
+	const int max_count_per_entry, const int max_idle_time)
+{
+    const int socket_domain = AF_INET;
+    return conn_pool_init_ex(cp, connect_timeout, max_count_per_entry,
+            max_idle_time, socket_domain);
 }
 
 int coon_pool_close_connections(const int index, const HashData *data, void *args)
@@ -79,13 +89,23 @@ int conn_pool_connect_server(ConnectionInfo *pConnection, \
 		const int connect_timeout)
 {
 	int result;
+    int domain;
 
 	if (pConnection->sock >= 0)
 	{
 		close(pConnection->sock);
 	}
 
-	pConnection->sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (pConnection->socket_domain == AF_INET ||
+            pConnection->socket_domain == AF_INET6)
+    {
+        domain = pConnection->socket_domain;
+    }
+    else
+    {
+        domain = is_ipv6_addr(pConnection->ip_addr) ? AF_INET6 : AF_INET;
+    }
+	pConnection->sock = socket(domain, SOCK_STREAM, 0);
 	if(pConnection->sock < 0)
 	{
 		logError("file: "__FILE__", line: %d, " \
@@ -118,26 +138,15 @@ int conn_pool_connect_server(ConnectionInfo *pConnection, \
 	return 0;
 }
 
-static int conn_pool_get_key(const ConnectionInfo *conn, char *key, int *key_len)
+static inline void  conn_pool_get_key(const ConnectionInfo *conn, char *key, int *key_len)
 {
-	struct in_addr sin_addr;
-
-        if (inet_aton(conn->ip_addr, &sin_addr) == 0)
-        {
-		*key_len = 0;
-                return EINVAL;
-        }
-
-	int2buff(sin_addr.s_addr, key);
-	*key_len = 4 + sprintf(key + 4, "%d", conn->port);
-
-	return 0;
+    *key_len = sprintf(key, "%s_%d", conn->ip_addr, conn->port);
 }
 
 ConnectionInfo *conn_pool_get_connection(ConnectionPool *cp, 
 	const ConnectionInfo *conn, int *err_no)
 {
-	char key[32];
+	char key[INET6_ADDRSTRLEN + 8];
 	int key_len;
 	int bytes;
 	char *p;
@@ -146,11 +155,7 @@ ConnectionInfo *conn_pool_get_connection(ConnectionPool *cp,
 	ConnectionInfo *ci;
 	time_t current_time;
 
-	*err_no = conn_pool_get_key(conn, key, &key_len);
-	if (*err_no != 0)
-	{
-		return NULL;
-	}
+	conn_pool_get_key(conn, key, &key_len);
 
 	pthread_mutex_lock(&cp->lock);
 	cm = (ConnectionManager *)hash_find(&cp->hash_array, key, key_len);
@@ -223,6 +228,7 @@ ConnectionInfo *conn_pool_get_connection(ConnectionPool *cp,
 			pthread_mutex_unlock(&cm->lock);
 
 			memcpy(node->conn, conn, sizeof(ConnectionInfo));
+            node->conn->socket_domain = cp->socket_domain;
 			node->conn->sock = -1;
 			*err_no = conn_pool_connect_server(node->conn, \
 					cp->connect_timeout);
@@ -276,6 +282,7 @@ ConnectionInfo *conn_pool_get_connection(ConnectionPool *cp,
 				"total_count: %d, free_count: %d", 
 				__LINE__, conn->ip_addr, conn->port, 
 				ci->sock, cm->total_count, cm->free_count);
+            *err_no = 0;
 			return ci;
 		}
 	}
@@ -284,17 +291,12 @@ ConnectionInfo *conn_pool_get_connection(ConnectionPool *cp,
 int conn_pool_close_connection_ex(ConnectionPool *cp, ConnectionInfo *conn, 
 	const bool bForce)
 {
-	char key[32];
-	int result;
+	char key[INET6_ADDRSTRLEN + 8];
 	int key_len;
 	ConnectionManager *cm;
 	ConnectionNode *node;
 
-	result = conn_pool_get_key(conn, key, &key_len);
-	if (result != 0)
-	{
-		return result;
-	}
+	conn_pool_get_key(conn, key, &key_len);
 
 	pthread_mutex_lock(&cp->lock);
 	cm = (ConnectionManager *)hash_find(&cp->hash_array, key, key_len);

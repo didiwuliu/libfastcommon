@@ -11,9 +11,36 @@
 #ifndef _SOCKETOPT_H_
 #define _SOCKETOPT_H_
 
+#include <net/if.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
 #include "common_define.h"
 
-#define FDFS_WRITE_BUFF_SIZE  256 * 1024
+#define FAST_WRITE_BUFF_SIZE  256 * 1024
+
+typedef struct fast_if_config {
+    char name[IF_NAMESIZE];    //if name
+    char mac[32];
+    char ipv4[IP_ADDRESS_SIZE];
+    char ipv6[48];
+} FastIFConfig;
+
+typedef struct ip_addr_s {
+    char ip_addr[INET6_ADDRSTRLEN];
+    int socket_domain;
+} ip_addr_t;
+
+#ifdef SO_NOSIGPIPE
+#define SET_SOCKOPT_NOSIGPIPE(sock) \
+    do { \
+    int set = 1;  \
+    setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(int)); \
+    } while (0)
+#else
+#define SET_SOCKOPT_NOSIGPIPE(sock)
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -220,6 +247,15 @@ char *getHostnameByIp(const char *szIpAddr, char *buff, const int bufferSize);
 */
 in_addr_t getIpaddrByName(const char *name, char *buff, const int bufferSize);
 
+/** get by ip addresses by it's hostname
+ *  parameters:
+ *          name: the hostname
+ *          ip_addr_arr: ip address array to store the ip address
+ *          ip_addr_arr_size: ip address array size
+ *  return: ip address count
+*/
+int getIpaddrsByName(const char *name, ip_addr_t *ip_addr_arr, const int ip_addr_arr_size);
+
 /** bind wrapper 
  *  parameters:
  *          sock: the socket
@@ -317,16 +353,6 @@ int tcpdiscard(int sock, const int bytes, const int timeout, \
 int getlocaladdrs(char ip_addrs[][IP_ADDRESS_SIZE], \
 	const int max_count, int *count);
 
-/** get local host ip addresses
- *  parameters:
- *          ip_addrs: store the ip addresses
- *          max_count: max ip address (max ip_addrs elements)
- *          count: store the ip address count
- *  return: error no, 0 success, != 0 fail
-*/
-int getlocaladdrs1(char ip_addrs[][IP_ADDRESS_SIZE], \
-	const int max_count, int *count);
-
 /** get local host ip addresses by if alias prefix
  *  parameters:
  *          if_alias_prefixes: if alias prefixes, such as eth, bond etc.
@@ -338,6 +364,33 @@ int getlocaladdrs1(char ip_addrs[][IP_ADDRESS_SIZE], \
 */
 int gethostaddrs(char **if_alias_prefixes, const int prefix_count, \
 	char ip_addrs[][IP_ADDRESS_SIZE], const int max_count, int *count);
+
+/** get local if configs
+ *  parameters:
+ *          if_configs: store the if configs
+ *          max_count: max ifconfig elements
+ *          count: store the ifconfig count
+ *  return: error no, 0 success, != 0 fail
+*/
+int getifconfigs(FastIFConfig *if_configs, const int max_count, int *count);
+
+/** set socket address by ip
+ *  parameters:
+ *          ip: the ip address
+ *          port: the port
+ *          addr: ipv4 addr
+ *          addr6: ipv6 addr
+ *          output: return addr pointer
+ *          size: return the size of addr
+ *  return: error no, 0 success, != 0 fail
+*/
+int setsockaddrbyip(const char *ip, const short port, struct sockaddr_in *addr,
+        struct sockaddr_in6 *addr6, void **output, int *size);
+
+static inline bool is_ipv6_addr(const char *ip)
+{
+    return (*ip == ':' || strchr(ip, ':') != NULL); //ipv6
+}
 
 #ifdef __cplusplus
 }

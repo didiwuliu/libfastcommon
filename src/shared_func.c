@@ -23,9 +23,19 @@
 #include <dirent.h>
 #include <grp.h>
 #include <pwd.h>
+#include <math.h>
+
 #include "shared_func.h"
 #include "logger.h"
 #include "sockopt.h"
+
+#ifdef OS_LINUX
+#include <sys/sysinfo.h>
+#else
+#ifdef OS_FREEBSD
+#include <sys/sysctl.h>
+#endif
+#endif
 
 char *formatDatetime(const time_t nTime, \
 	const char *szDateFormat, \
@@ -377,27 +387,22 @@ int getExecResult(const char *command, char *output, const int buff_size)
 
 	if((fp=popen(command, "r")) == NULL)
 	{
+        *output = '\0';
 		return errno != 0 ? errno : EMFILE;
 	}
 
 	pCurrent = output;
-	remain_bytes = buff_size;
+	remain_bytes = buff_size - 1;
 	while (remain_bytes > 0 && \
 		(bytes_read=fread(pCurrent, 1, remain_bytes, fp)) > 0)
 	{
 		pCurrent += bytes_read;
 		remain_bytes -= bytes_read;
 	}
-
 	pclose(fp);
 
-	if (remain_bytes <= 0)
-	{
-		return ENOSPC;
-	}
-
 	*pCurrent = '\0';
-	return 0;
+	return remain_bytes > 0 ? 0 : ENOSPC;
 }
 
 #endif
@@ -949,7 +954,35 @@ void chopPath(char *filePath)
 int getFileContent(const char *filename, char **buff, int64_t *file_size)
 {
 	int fd;
-	
+
+    errno = 0;
+    if (!isFile(filename))
+    {
+		*buff = NULL;
+		*file_size = 0;
+        if (errno != 0)
+        {
+            if (errno == ENOENT)
+            {
+                logError("file: "__FILE__", line: %d, "
+                        "file %s not exist", __LINE__, filename);
+            }
+            else
+            {
+                logError("file: "__FILE__", line: %d, "
+                        "stat %s fail, errno: %d, error info: %s",
+                        __LINE__, filename, errno, STRERROR(errno));
+            }
+            return errno != 0 ? errno : ENOENT;
+        }
+        else
+        {
+            logError("file: "__FILE__", line: %d, "
+                    "%s is not a regular file", __LINE__, filename);
+            return EINVAL;
+        }
+    }
+
 	fd = open(filename, O_RDONLY);
 	if (fd < 0)
 	{
@@ -1052,7 +1085,7 @@ int getFileContentEx(const char *filename, char *buff, \
 		return errno != 0 ? errno : EIO;
 	}
 
-	if ((read_bytes=read(fd, buff, *size)) < 0)
+	if ((read_bytes=read(fd, buff, *size - 1)) < 0)
 	{
 		*size = 0;
 		close(fd);
@@ -1285,10 +1318,50 @@ int set_rlimit(int resource, const rlim_t value)
 	limit.rlim_cur = value;
 	if (setrlimit(resource, &limit) != 0)
 	{
+        const char *label;
+        switch (resource)
+        {
+            case RLIMIT_CPU:
+                label = "CPU time in sec";
+                break;
+            case RLIMIT_STACK:
+                label = "max stack size";
+                break;
+            case RLIMIT_DATA:
+                label = "max data size";
+                break;
+            case RLIMIT_FSIZE:
+                label = "max file size";
+                break;
+            case RLIMIT_RSS:
+                label = "max RSS";
+                break;
+            case RLIMIT_CORE:
+                label = "max core file size";
+                break;
+            case RLIMIT_NPROC:
+                label = "max processes";
+                break;
+            case RLIMIT_NOFILE:
+                label = "max open files";
+                break;
+#ifdef RLIMIT_MSGQUEUE
+            case RLIMIT_MSGQUEUE:
+                label = "max bytes in msg queues";
+                break;
+#endif
+            case RLIMIT_MEMLOCK:
+                label = "max locked-in-memory address space";
+                break;
+            default:
+                label = "unkown";
+                break;
+        }
+
 		logError("file: "__FILE__", line: %d, " \
-			"call setrlimit fail, resource=%d, value=%d, " \
+			"call setrlimit fail, resource=%d (%s), value=%"PRId64", " \
 			"errno: %d, error info: %s", \
-			__LINE__, resource, (int)value, \
+			__LINE__, resource, label, (int64_t)value, \
 			errno, STRERROR(errno));
 		return errno != 0 ? errno : EPERM;
 	}
@@ -1321,7 +1394,9 @@ int load_log_level_ex(const char *conf_filename)
 	int result;
 	IniContext iniContext;
 
-	if ((result=iniLoadFromFile(conf_filename, &iniContext)) != 0)
+	if ((result=iniLoadFromFileEx(conf_filename, &iniContext,
+                    FAST_INI_ANNOTATION_DISABLE, NULL, 0,
+                    FAST_INI_FLAGS_NONE)) != 0)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"load conf file \"%s\" fail, ret code: %d", \
@@ -1382,11 +1457,11 @@ void set_log_level(char *pLogLevel)
 	}
 }
 
-int fd_add_flags(int fd, int adding_flags)
+int fcntl_add_flags(int fd, int get_cmd, int set_cmd, int adding_flags)
 {
 	int flags;
 
-	flags = fcntl(fd, F_GETFL, 0);
+	flags = fcntl(fd, get_cmd, 0);
 	if (flags < 0)
 	{
 		logError("file: "__FILE__", line: %d, " \
@@ -1395,7 +1470,7 @@ int fd_add_flags(int fd, int adding_flags)
 		return errno != 0 ? errno : EACCES;
 	}
 
-	if (fcntl(fd, F_SETFL, flags | adding_flags) == -1)
+	if (fcntl(fd, set_cmd, flags | adding_flags) == -1)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"fcntl fail, errno: %d, error info: %s.", \
@@ -1404,6 +1479,16 @@ int fd_add_flags(int fd, int adding_flags)
 	}
 
 	return 0;
+}
+
+int fd_add_flags(int fd, int adding_flags)
+{
+    return fcntl_add_flags(fd, F_GETFL, F_SETFL, adding_flags);
+}
+
+int fd_set_cloexec(int fd)
+{
+    return fcntl_add_flags(fd, F_GETFD, F_SETFD, FD_CLOEXEC);
 }
 
 int set_run_by(const char *group_name, const char *username)
@@ -1460,20 +1545,286 @@ int set_run_by(const char *group_name, const char *username)
 	return 0;
 }
 
+static int check_realloc_allow_ips(in_addr_t **allow_ip_addrs,
+	int *alloc_count, const int target_ip_count)
+{
+	int bytes;
+	if (*alloc_count < target_ip_count)
+	{
+		*alloc_count = target_ip_count;
+		bytes = sizeof(in_addr_t) * (*alloc_count);
+		*allow_ip_addrs = (in_addr_t *)realloc(*allow_ip_addrs, bytes);
+		if (*allow_ip_addrs == NULL)
+		{
+			logError("file: "__FILE__", line: %d, "\
+				"malloc %d bytes fail, " \
+				"errno: %d, error info: %s", \
+				__LINE__, bytes, errno, STRERROR(errno));
+
+			return errno != 0 ? errno : ENOMEM;
+		}
+	}
+
+	return 0;
+}
+
+static int parse_cidr_ips(const char *ip_addr, in_addr_t **allow_ip_addrs,
+	int *alloc_count, int *allow_ip_count, const int remain_items)
+{
+	char *pSlash;
+	char *pReservedEnd;
+	char ip_part[IP_ADDRESS_SIZE];
+	int ip_len;
+	int network_bits;
+	int host_bits;
+	int bits;
+	uint32_t hip;
+	in_addr_t nip;
+	int h;
+	int count;
+	int result;
+	struct in_addr addr;
+
+	pSlash = strchr(ip_addr, '/');
+	if (pSlash == NULL)
+	{
+		return EINVAL;
+	}
+
+	ip_len = pSlash - ip_addr;
+	if (ip_len == 0 || ip_len >= IP_ADDRESS_SIZE)
+	{
+		logError("file: "__FILE__", line: %d, " \
+			"invalid ip address: %s", \
+			__LINE__, ip_addr);
+		return EINVAL;
+	}
+	memcpy(ip_part, ip_addr, ip_len);
+	*(ip_part + ip_len) = '\0';
+	
+	pReservedEnd = NULL;
+	network_bits = strtol(pSlash + 1, &pReservedEnd, 10);
+	if (!(pReservedEnd == NULL || *pReservedEnd == '\0'))
+	{
+		logError("file: "__FILE__", line: %d, " \
+			"ip address: %s, invalid network bits: %s",
+			__LINE__, ip_addr, pSlash + 1);
+		return EINVAL;
+	}
+
+	if (network_bits < 16 || network_bits >= 32)
+	{
+		logError("file: "__FILE__", line: %d, " \
+			"ip address: %s, invalid network bits: %d, " \
+			"it should >= 16 and < 32", \
+			__LINE__, ip_addr, network_bits);
+		return EINVAL;
+	}
+
+	if (inet_pton(AF_INET, ip_part, &addr) != 1)
+	{
+		logError("file: "__FILE__", line: %d, " \
+			"ip address: %s, invalid ip part: %s", \
+			__LINE__, ip_addr, ip_part);
+		return EINVAL;
+	}
+
+	host_bits = 32 - network_bits;
+	count = 2;
+	bits = host_bits;
+	while (--bits)
+	{
+		count *= 2;
+	}
+
+	if ((result=check_realloc_allow_ips(allow_ip_addrs,
+		alloc_count, (*allow_ip_count) + count + remain_items)) != 0)
+	{
+		return result;
+	}
+
+	logDebug("CIDR ip: %s, ip count: %d", ip_addr, count);
+
+	hip = ntohl(addr.s_addr);
+	for (h=0; h<count; h++)
+	{
+		struct sockaddr_in a;
+
+		nip = htonl(hip | h);
+		(*allow_ip_addrs)[*allow_ip_count] = nip;
+		(*allow_ip_count)++;
+
+		a.sin_addr.s_addr = nip;
+		if (inet_ntop(AF_INET, &a.sin_addr, ip_part, IP_ADDRESS_SIZE) != NULL)
+		{
+			logDebug("%d. %s", h + 1, ip_part);
+		}
+	}
+
+	return 0;
+}
+
+static int parse_range_hosts(const char *value, char *pStart, char *pEnd,
+	char *hostname, const int nHeadLen, in_addr_t **allow_ip_addrs,
+	int *alloc_count, int *allow_ip_count, const int remain_items)
+{
+	char *pTail;
+	char *p;
+	int result;
+	int i;
+	in_addr_t addr;
+
+	pTail = pEnd + 1;
+	p = pStart + 1;  //skip [
+	while (p <= pEnd)
+	{
+		char *pNumStart1;
+		char *pNumStart2;
+		int nStart;
+		int nEnd;
+		int nNumLen1;
+		int nNumLen2;
+		char end_ch1;
+		char end_ch2;
+		char szFormat[16];
+
+		while (*p == ' ' || *p == '\t') //trim prior spaces
+		{
+			p++;
+		}
+
+		pNumStart1 = p;
+		while (*p >='0' && *p <= '9')
+		{
+			p++;
+		}
+
+		nNumLen1 = p - pNumStart1;
+		while (*p == ' ' || *p == '\t') //trim tail spaces
+		{
+			p++;
+		}
+
+		if (!(*p == ',' || *p == '-' || *p == ']'))
+		{
+			logError("file: "__FILE__", line: %d, " \
+				"invalid char \"%c\" in host name: %s",\
+				__LINE__, *p, value);
+			return EINVAL;
+		}
+
+		end_ch1 = *p;
+		*(pNumStart1 + nNumLen1) = '\0';
+
+		if (nNumLen1 == 0)
+		{
+			logError("file: "__FILE__", line: %d, " \
+				"invalid host name: %s, " \
+				"empty entry before \"%c\"", \
+				__LINE__, value, end_ch1);
+			return EINVAL;
+		}
+
+		nStart = atoi(pNumStart1);
+		if (end_ch1 == '-')
+		{
+			p++;   //skip -
+
+			/* trim prior spaces */
+			while (*p == ' ' || *p == '\t')
+			{
+				p++;
+			}
+
+			pNumStart2 = p;
+			while (*p >='0' && *p <= '9')
+			{
+				p++;
+			}
+
+			nNumLen2 = p - pNumStart2;
+			/* trim tail spaces */
+			while (*p == ' ' || *p == '\t')
+			{
+				p++;
+			}
+
+			if (!(*p == ',' || *p == ']'))
+			{
+				logError("file: "__FILE__", line: %d, " \
+					"invalid char \"%c\" in host name: %s",\
+					__LINE__, *p, value);
+				return EINVAL;
+			}
+
+			end_ch2 = *p;
+			*(pNumStart2 + nNumLen2) = '\0';
+
+			if (nNumLen2 == 0)
+			{
+				logError("file: "__FILE__", line: %d, " \
+					"invalid host name: %s, " \
+					"empty entry before \"%c\"", \
+					__LINE__, value, end_ch2);
+				return EINVAL;
+			}
+
+			nEnd = atoi(pNumStart2);
+		}
+		else
+		{
+			nEnd = nStart;
+		}
+
+
+		if ((result=check_realloc_allow_ips(allow_ip_addrs,
+			alloc_count, (*allow_ip_count) + remain_items +
+			(nEnd - nStart + 1))) != 0)
+		{
+			return result;
+		}
+
+		sprintf(szFormat, "%%0%dd%%s",  nNumLen1);
+		for (i=nStart; i<=nEnd; i++)
+		{
+			sprintf(hostname + nHeadLen, szFormat, \
+				i, pTail);
+
+			addr = getIpaddrByName(hostname, NULL, 0);
+			if (addr == INADDR_NONE)
+			{
+				logWarning("file: "__FILE__", line: %d, " \
+					"invalid host name: %s", \
+					__LINE__, hostname);
+			}
+			else
+			{
+				(*allow_ip_addrs)[*allow_ip_count] = addr;
+				(*allow_ip_count)++;
+			}
+
+		}
+
+		p++;
+	}
+
+	return 0;
+}
+
 int load_allow_hosts(IniContext *pIniContext, \
 		in_addr_t **allow_ip_addrs, int *allow_ip_count)
 {
+	int result;
 	int count;
 	IniItem *pItem;
 	IniItem *pItemStart;
 	IniItem *pItemEnd;
-	char *pItemValue;
+	char item_value[256];
 	char *pStart;
 	char *pEnd;
-	char *p;
-	char *pTail;
 	int alloc_count;
 	int nHeadLen;
+	int nValueLen;
 	int i;
 	in_addr_t addr;
 	char hostname[256];
@@ -1519,6 +1870,17 @@ int load_allow_hosts(IniContext *pIniContext, \
 		pStart = strchr(pItem->value, '[');
 		if (pStart == NULL)
 		{
+			if (strchr(pItem->value, '/') != NULL) //CIDR addresses
+			{
+				if ((result=parse_cidr_ips(pItem->value,
+					allow_ip_addrs, &alloc_count,
+					allow_ip_count, pItemEnd - pItem)) != 0)
+				{
+					return result;
+				}
+				continue;
+			}
+
 			addr = getIpaddrByName(pItem->value, NULL, 0);
 			if (addr == INADDR_NONE)
 			{
@@ -1528,24 +1890,10 @@ int load_allow_hosts(IniContext *pIniContext, \
 			}
 			else
 			{
-				if (alloc_count < (*allow_ip_count) + 1)
+				if ((result=check_realloc_allow_ips(allow_ip_addrs,
+					&alloc_count, (*allow_ip_count) + (pItemEnd - pItem))) != 0)
 				{
-					alloc_count = (*allow_ip_count) + \
-							(pItemEnd - pItem);
-					*allow_ip_addrs = (in_addr_t *)realloc(
-						*allow_ip_addrs, 
-						sizeof(in_addr_t)*alloc_count);
-					if (*allow_ip_addrs == NULL)
-					{
-					logError("file: "__FILE__", line: %d, "\
-						"malloc %d bytes fail, " \
-						"errno: %d, error info: %s", \
-						__LINE__, (int)sizeof(in_addr_t)
-							* alloc_count, \
-						errno, STRERROR(errno));
-
-					return errno != 0 ? errno : ENOMEM;
-					}
+					return result;
 				}
 
 				(*allow_ip_addrs)[*allow_ip_count] = addr;
@@ -1559,177 +1907,32 @@ int load_allow_hosts(IniContext *pIniContext, \
 		pEnd = strchr(pStart, ']');
 		if (pEnd == NULL)
 		{
-			logWarning("file: "__FILE__", line: %d, " \
+			logError("file: "__FILE__", line: %d, " \
 				"invalid host name: %s, expect \"]\"", \
 				__LINE__, pItem->value);
-			continue;
+			return EINVAL;
 		}
 
-		pItemValue = strdup(pItem->value);
-		if (pItemValue == NULL)
+		nValueLen = strlen(pItem->value);
+		if (nValueLen >= (int)sizeof(item_value))
 		{
-			logWarning("file: "__FILE__", line: %d, " \
-				"strdup fail, " \
-				"errno: %d, error info: %s.", \
-				__LINE__, errno, STRERROR(errno));
-			continue;
+			logError("file: "__FILE__", line: %d, " \
+				"hostname too long, exceeds %d bytes", \
+				__LINE__, (int)sizeof(item_value));
+			return EINVAL;
 		}
-
+		memcpy(item_value, pItem->value, nValueLen + 1);
 		nHeadLen = pStart - pItem->value;
-		pStart = pItemValue + nHeadLen;
-		pEnd = pItemValue + (pEnd - pItem->value);
-		pTail = pEnd + 1;
-
 		memcpy(hostname, pItem->value, nHeadLen);
-		p = pStart + 1;  //skip [
 
-		while (p <= pEnd)
+		result = parse_range_hosts(pItem->value, item_value + nHeadLen,
+				item_value + (pEnd - pItem->value),
+				hostname, nHeadLen, allow_ip_addrs,
+				&alloc_count, allow_ip_count, pItemEnd - pItem);
+		if (result != 0)
 		{
-			char *pNumStart1;
-			char *pNumStart2;
-			int nStart;
-			int nEnd;
-			int nNumLen1;
-			int nNumLen2;
-			char end_ch1;
-			char end_ch2;
-			char szFormat[16];
-
-			while (*p == ' ' || *p == '\t') //trim prior spaces
-			{
-				p++;
-			}
-
-			pNumStart1 = p;
-			while (*p >='0' && *p <= '9')
-			{
-				p++;
-			}
-
-			nNumLen1 = p - pNumStart1;
-			while (*p == ' ' || *p == '\t') //trim tail spaces
-			{
-				p++;
-			}
-
-			if (!(*p == ',' || *p == '-' || *p == ']'))
-			{
-				logWarning("file: "__FILE__", line: %d, " \
-					"invalid char \"%c\" in host name: %s",\
-					__LINE__, *p, pItem->value);
-				break;
-			}
-
-			end_ch1 = *p;
-			*(pNumStart1 + nNumLen1) = '\0';
-
-			if (nNumLen1 == 0)
-			{
-				logWarning("file: "__FILE__", line: %d, " \
-					"invalid host name: %s, " \
-					"empty entry before \"%c\"", \
-					__LINE__, pItem->value, end_ch1);
-				break;
-			}
-
-			nStart = atoi(pNumStart1);
-			if (end_ch1 == '-')
-			{
-				p++;   //skip -
-
-				/* trim prior spaces */
-				while (*p == ' ' || *p == '\t')
-				{
-					p++;
-				}
-
-				pNumStart2 = p;
-				while (*p >='0' && *p <= '9')
-				{
-					p++;
-				}
-
-				nNumLen2 = p - pNumStart2;
-				/* trim tail spaces */
-				while (*p == ' ' || *p == '\t')
-				{
-					p++;
-				}
-
-				if (!(*p == ',' || *p == ']'))
-				{
-				logWarning("file: "__FILE__", line: %d, " \
-					"invalid char \"%c\" in host name: %s",\
-					__LINE__, *p, pItem->value);
-				break;
-				}
-
-				end_ch2 = *p;
-				*(pNumStart2 + nNumLen2) = '\0';
-
-				if (nNumLen2 == 0)
-				{
-				logWarning("file: "__FILE__", line: %d, " \
-					"invalid host name: %s, " \
-					"empty entry before \"%c\"", \
-					__LINE__, pItem->value, end_ch2);
-				break;
-				}
-
-				nEnd = atoi(pNumStart2);
-			}
-			else
-			{
-				nEnd = nStart;
-			}
-
-			if (alloc_count < *allow_ip_count+(nEnd - nStart + 1))
-			{
-				alloc_count = *allow_ip_count + (nEnd - nStart)
-						 + (pItemEnd - pItem);
-				*allow_ip_addrs = (in_addr_t *)realloc(
-					*allow_ip_addrs, 
-					sizeof(in_addr_t)*alloc_count);
-				if (*allow_ip_addrs == NULL)
-				{
-					logError("file: "__FILE__", line: %d, "\
-						"malloc %d bytes fail, " \
-						"errno: %d, error info: %s.", \
-						__LINE__, \
-						(int)sizeof(in_addr_t) * \
-						alloc_count,\
-						errno, STRERROR(errno));
-
-					free(pItemValue);
-					return errno != 0 ? errno : ENOMEM;
-				}
-			}
-
-			sprintf(szFormat, "%%0%dd%%s",  nNumLen1);
-			for (i=nStart; i<=nEnd; i++)
-			{
-				sprintf(hostname + nHeadLen, szFormat, \
-					i, pTail);
-
-				addr = getIpaddrByName(hostname, NULL, 0);
-				if (addr == INADDR_NONE)
-				{
-				logWarning("file: "__FILE__", line: %d, " \
-					"invalid host name: %s", \
-					__LINE__, hostname);
-				}
-				else
-				{
-					(*allow_ip_addrs)[*allow_ip_count]=addr;
-					(*allow_ip_count)++;
-				}
-
-			}
-
-			p++;
+			return result;
 		}
-
-		free(pItemValue);
 	}
 
 	if (*allow_ip_count == 0)
@@ -1744,15 +1947,15 @@ int load_allow_hosts(IniContext *pIniContext, \
 			cmp_by_ip_addr_t);
 	}
 
-	/*
-	printf("*allow_ip_count=%d\n", *allow_ip_count);
+	logDebug("allow_ip_count=%d", *allow_ip_count);
 	for (i=0; i<*allow_ip_count; i++)
 	{
 		struct in_addr address;
+        char buff[INET_ADDRSTRLEN];
 		address.s_addr = (*allow_ip_addrs)[i];
-		printf("%s\n", inet_ntoa(address));
+		logDebug("%d. %s", i + 1, inet_ntop(AF_INET, &address,
+                    buff, sizeof(buff)));
 	}
-	*/
 
 	return 0;
 }
@@ -1817,18 +2020,31 @@ int get_time_item_from_conf(IniContext *pIniContext, \
 		const byte default_hour, const byte default_minute)
 {
 	char *pValue;
+	pValue = iniGetStrValue(NULL, item_name, pIniContext);
+    return get_time_item_from_str(pValue, item_name, pTimeInfo,
+		default_hour, default_minute);
+}
+
+int get_time_item_from_str(const char *pValue, const char *item_name,
+        TimeInfo *pTimeInfo, const byte default_hour,
+        const byte default_minute)
+{
 	int hour;
 	int minute;
+	int second;
+    int count;
 
-	pValue = iniGetStrValue(NULL, item_name, pIniContext);
 	if (pValue == NULL)
 	{
 		pTimeInfo->hour = default_hour;
 		pTimeInfo->minute = default_minute;
+		pTimeInfo->second = 0;
 		return 0;
 	}
 
-	if (sscanf(pValue, "%d:%d", &hour, &minute) != 2)
+    second = 0;
+    count = sscanf(pValue, "%d:%d:%d", &hour, &minute, &second);
+	if (count != 2 && count != 3)
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"item \"%s\" 's value \"%s\" is not an valid time", \
@@ -1836,7 +2052,8 @@ int get_time_item_from_conf(IniContext *pIniContext, \
 		return EINVAL;
 	}
 
-	if ((hour < 0 || hour > 23) || (minute < 0 || minute > 59))
+	if ((hour < 0 || hour > 23) || (minute < 0 || minute > 59)
+             || (second < 0 || second > 59))
 	{
 		logError("file: "__FILE__", line: %d, " \
 			"item \"%s\" 's value \"%s\" is not an valid time", \
@@ -1846,6 +2063,7 @@ int get_time_item_from_conf(IniContext *pIniContext, \
 
 	pTimeInfo->hour = (byte)hour;
 	pTimeInfo->minute = (byte)minute;
+	pTimeInfo->second = (byte)second;
 
 	return 0;
 }
@@ -1895,11 +2113,6 @@ char *urldecode(const char *src, const int src_len, char *dest, int *dest_len)
 
 char *urldecode_ex(const char *src, const int src_len, char *dest, int *dest_len)
 {
-#define IS_HEX_CHAR(ch) \
-	((ch >= '0' && ch <= '9') || \
-	 (ch >= 'a' && ch <= 'f') || \
-	 (ch >= 'A' && ch <= 'F'))
-
 #define HEX_VALUE(ch, value) \
 	if (ch >= '0' && ch <= '9') \
 	{ \
@@ -2086,3 +2299,367 @@ int ignore_signal_pipe()
 	return 0;
 }
 
+double get_line_distance_km(const double lat1, const double lon1,
+        const double lat2, const double lon2)
+{
+#define FAST_ABS(v) ((v) >= 0 ? (v) : -1 * (v))
+#define DISTANCE_PER_LATITUDE 111.111
+
+    double lat_value;
+    double lng_distance;
+    double lat_distance;
+
+    lat_value = FAST_ABS(lat1) < FAST_ABS(lat2) ? lat1 : lat2;
+    lat_distance = FAST_ABS(lat1 - lat2) * DISTANCE_PER_LATITUDE;
+    lng_distance = FAST_ABS(lon1 - lon2) * DISTANCE_PER_LATITUDE *
+        cos(lat_value * 3.1415926 / 180.0);
+
+    return sqrt(lat_distance * lat_distance + lng_distance * lng_distance);
+}
+
+bool is_private_ip(const char* ip)
+{
+    if (ip == NULL || (int)strlen(ip) < 8)
+    {
+        return false;
+    }
+
+    if (memcmp(ip, "10.", 3) == 0 || memcmp(ip, "192.168.", 8) == 0)
+    {
+        return true;
+    }
+    if (memcmp(ip, "172.", 4) == 0)
+    {
+        int b;
+        b = atoi(ip + 4);
+        if (b >= 16 && b < 32)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+int64_t get_current_time_us()
+{
+	struct timeval tv;
+
+	if (gettimeofday(&tv, NULL) != 0)
+	{
+		logError("file: "__FILE__", line: %d, " \
+			 "call gettimeofday fail, " \
+			 "errno: %d, error info: %s", \
+			 __LINE__, errno, STRERROR(errno));
+		return errno != 0 ? errno : EPERM;
+	}
+
+	return ((int64_t)tv.tv_sec * 1000 * 1000 + (int64_t)tv.tv_usec);
+}
+
+inline bool is_power2(const int64_t n)
+{
+    return ((n != 0) && !(n & (n - 1)));	
+}
+
+static inline int do_lock_file(int fd, int cmd, int type)
+{
+    struct flock lock;
+    int result;
+
+    memset(&lock, 0, sizeof(lock));
+    lock.l_type = type;
+    lock.l_whence = SEEK_SET;
+    do
+    {
+        if ((result=fcntl(fd, cmd, &lock)) != 0)
+        {
+            result = errno != 0 ? errno : ENOMEM;
+            fprintf(stderr, "call fcntl fail, "
+                   "errno: %d, error info: %s\n",
+                   result, STRERROR(result));
+        }
+    } while (result == EINTR);
+
+    return result;
+}
+
+int file_read_lock(int fd)
+{
+    return do_lock_file(fd, F_SETLKW, F_RDLCK);
+}
+
+int file_write_lock(int fd)
+{
+    return do_lock_file(fd, F_SETLKW, F_WRLCK);
+}
+
+int file_unlock(int fd)
+{
+    return do_lock_file(fd, F_SETLKW, F_UNLCK);
+}
+
+int file_try_read_lock(int fd)
+{
+    return do_lock_file(fd, F_SETLK, F_RDLCK);
+}
+
+int file_try_write_lock(int fd)
+{
+    return do_lock_file(fd, F_SETLK, F_WRLCK);
+}
+
+int file_try_unlock(int fd)
+{
+    return do_lock_file(fd, F_SETLK, F_UNLCK);
+}
+
+bool isLeadingSpacesLine(const char *content, const char *current)
+{
+    const char *p;
+    p = current - 1;
+    while (p >= content)
+    {
+        if (!(*p == ' ' || *p == '\t'))
+        {
+            break;
+        }
+        --p;
+    }
+    return (p < content || *p == '\n');
+}
+
+bool isTrailingSpacesLine(const char *tail, const char *end)
+{
+    const char *p;
+    p = tail;
+    while (p < end)
+    {
+        if (!(*p == ' ' || *p == '\t'))
+        {
+            break;
+        }
+        ++p;
+    }
+    return (p == end || *p == '\n');
+}
+
+ssize_t fc_safe_write(int fd, const char *buf, const size_t nbyte)
+{
+    ssize_t n;
+    ssize_t remain;
+    const char *p;
+
+    n = write(fd, buf, nbyte);
+    if (n < 0)
+    {
+        if (errno != EINTR)
+        {
+            return -1;
+        }
+        n = 0;
+    }
+    else if (n == nbyte)
+    {
+        return nbyte;
+    }
+
+    p = buf + n;
+    remain = nbyte - n;
+    while (remain > 0)
+    {
+        n = write(fd, p, remain);
+        if (n < 0)
+        {
+            ssize_t written;
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            written = nbyte - remain;
+            return written > 0 ? written : -1;
+        }
+
+        p += n;
+        remain -= n;
+    }
+
+    return nbyte;
+}
+
+ssize_t fc_lock_write(int fd, const char *buf, const size_t nbyte)
+{
+    int lock_result;
+    ssize_t result;
+
+    lock_result = file_write_lock(fd);
+    result = fc_safe_write(fd, buf, nbyte);
+    if (lock_result == 0)
+    {
+        file_unlock(fd);
+    }
+
+    return result;
+}
+
+ssize_t fc_safe_read(int fd, char *buf, const size_t count)
+{
+    ssize_t n;
+    ssize_t remain;
+    char *p;
+
+    n = read(fd, buf, count);
+    if (n < 0)
+    {
+        if (errno != EINTR)
+        {
+            return -1;
+        }
+        n = 0;
+    }
+    else
+    {
+        if (n == 0 || n == count)
+        {
+            return n;
+        }
+    }
+
+    p = buf + n;
+    remain = count - n;
+    while (remain > 0)
+    {
+        n = read(fd, p, remain);
+        if (n < 0)
+        {
+            ssize_t done;
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            done = count - remain;
+            return done > 0 ? done : -1;
+        }
+        else if (n == 0)
+        {
+            break;
+        }
+
+        p += n;
+        remain -= n;
+    }
+
+    return count - remain;
+}
+
+key_t fc_ftok(const char *path, const int proj_id)
+{
+    int hash_code;
+    hash_code = simple_hash(path, strlen(path));
+    return (((proj_id & 0xFF) << 24) | (hash_code & 0xFFFFFF));
+}
+
+static void add_thousands_separator(char *str, const int len)
+{
+    int new_len;
+    int addings;
+    int sub;
+    int chars;
+    int add_count;
+    char *src;
+    char *dest;
+    char *first;
+
+    if (len <= 3)
+    {
+        return;
+    }
+
+    if (*str == '-')
+    {
+        first = str + 1;
+        sub = 2;
+    }
+    else
+    {
+        first = str;
+        sub = 1;
+    }
+
+    addings = (len - sub) / 3;
+    new_len = len + addings;
+
+    src = str + (len - 1);
+    dest = str + new_len;
+    *dest-- = '\0';
+    chars = 0;
+    add_count = 0;
+    while (src >= first)
+    {
+        *dest-- = *src--;
+        if (++chars % 3 == 0)
+        {
+            if (add_count == addings)
+            {
+                break;
+            }
+
+            *dest-- = ',';
+            add_count++;
+        }
+    }
+}
+
+const char *int2str(const int n, char *buff, const bool thousands_separator)
+{
+    int len;
+    len = sprintf(buff, "%d", n);
+    if (thousands_separator)
+    {
+        add_thousands_separator(buff, len);
+    }
+    return buff;
+}
+
+const char *long2str(const int64_t n, char *buff, const bool thousands_separator)
+{
+    int len;
+    len = sprintf(buff, "%"PRId64, n);
+    if (thousands_separator)
+    {
+        add_thousands_separator(buff, len);
+    }
+    return buff;
+}
+
+bool starts_with(const char *str, const char *needle)
+{
+    int str_len;
+    int needle_len;
+
+    str_len = strlen(str);
+    needle_len = strlen(needle);
+    if (needle_len > str_len) {
+        return false;
+    }
+
+    return memcmp(str, needle, needle_len) == 0;
+}
+
+bool ends_with(const char *str, const char *needle)
+{
+    int str_len;
+    int needle_len;
+    int start_offset;
+
+    str_len = strlen(str);
+    needle_len = strlen(needle);
+    start_offset = str_len - needle_len;
+    if (start_offset < 0) {
+        return false;
+    }
+
+    return memcmp(str + start_offset, needle, needle_len) == 0;
+}

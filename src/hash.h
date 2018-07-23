@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#define CRC32_XINIT 0xFFFFFFFF		/* initial value */
+#define CRC32_XINIT 0xFFFFFFFF      /* initial value */
 #define CRC32_XOROT 0xFFFFFFFF		/* final xor value */
 
 typedef int (*HashFunc) (const void *key, const int key_len);
@@ -103,7 +103,7 @@ typedef int (*HashWalkFunc)(const int index, const HashData *data, void *args);
  *         pHash: the hash table
  *         hash_func: hash function
  *         capacity: init capacity
- *         load_factor: hash load factor, such as 0.75
+ *         load_factor: hash load factor (or watermark), >= 0.10 for auto rehash. eg. 0.75
  *         max_bytes:  max memory can be used (bytes)
  *         bMallocValue: if need malloc value buffer
  * return 0 for success, != 0 for error
@@ -350,9 +350,9 @@ int simple_hash(const void* key, const int key_len);
 int simple_hash_ex(const void* key, const int key_len, \
 	const int init_value);
 
-int CRC32(void *key, const int key_len);
-int CRC32_ex(void *key, const int key_len, \
-	const int init_value);
+int CRC32(const void *key, const int key_len);
+int64_t CRC32_ex(const void *key, const int key_len, \
+	const int64_t init_value);
 
 #define CRC32_FINAL(crc)  (crc ^ CRC32_XOROT)
 
@@ -372,6 +372,8 @@ int CRC32_ex(void *key, const int key_len, \
 #define FINISH_HASH_CODES4(hash_codes) \
 	hash_codes[0] = CRC32_FINAL(hash_codes[0]); \
 
+
+unsigned int *hash_get_prime_capacity(const int capacity);
 
 #ifdef __cplusplus
 }

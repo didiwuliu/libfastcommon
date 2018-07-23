@@ -192,6 +192,63 @@ void long2buff(int64_t n, char *buff);
 */
 int64_t buff2long(const char *buff);
 
+
+/** 32 bits float convert to buffer (big-endian)
+ *  parameters:
+ *  	n: 32 bits float value
+ *  	buff: the buffer, at least 4 bytes space, no tail \0
+ *  return: none
+*/
+static inline void float2buff(float f, char *buff)
+{
+    int *p;
+    p = (int *)&f;
+    int2buff(*p, buff);
+}
+
+/** buffer convert to 32 bits float
+ *  parameters:
+ *  	buff: big-endian 8 bytes buffer
+ *  return: 32 bits float value
+*/
+static inline float buff2float(const char *buff)
+{
+    int n;
+    float *p;
+
+    n = buff2int(buff);
+    p = (float *)&n;
+    return *p;
+}
+
+/** double (64 bits) convert to buffer (big-endian)
+ *  parameters:
+ *  	n: 64 bits double value
+ *  	buff: the buffer, at least 8 bytes space, no tail \0
+ *  return: none
+*/
+static inline void double2buff(double d, char *buff)
+{
+    int64_t *p;
+    p = (int64_t *)&d;
+    long2buff(*p, buff);
+}
+
+/** buffer convert to 64 bits double
+ *  parameters:
+ *  	buff: big-endian 8 bytes buffer
+ *  return: 64 bits double value
+*/
+static inline double buff2double(const char *buff)
+{
+    int64_t n;
+    double *p;
+
+    n = buff2long(buff);
+    p = (double *)&n;
+    return *p;
+}
+
 /** trim leading spaces ( \t\r\n)
  *  parameters:
  *  	pStr: the string to trim
@@ -212,6 +269,18 @@ char *trim_right(char *pStr);
  *  return: trimed string porinter as pStr
 */
 char *trim(char *pStr);
+
+/** trim leading and tail spaces ( \t\r\n)
+ *  parameters:
+ *  	pStr: the string to trim
+ *  return: trimed string porinter as pStr
+*/
+static inline char *fc_trim(char *pStr)
+{
+	trim_right(pStr);
+	trim_left(pStr);
+	return pStr;
+}
 
 /** copy string to BufferInfo
  *  parameters:
@@ -370,7 +439,7 @@ int load_allow_hosts(IniContext *pIniContext, \
 /** get time item from config context
  *  parameters:
  *  	pIniContext: the config context
- *  	item_name: item name in config file, time format: hour:minute, such as 15:25
+ *  	item_name: item name in config file, time format as hour:minute, such as 15:25
  *  	pTimeInfo: store time info
  *  	default_hour: default hour value
  *  	default_minute: default minute value
@@ -379,6 +448,20 @@ int load_allow_hosts(IniContext *pIniContext, \
 int get_time_item_from_conf(IniContext *pIniContext, \
 		const char *item_name, TimeInfo *pTimeInfo, \
 		const byte default_hour, const byte default_minute);
+
+
+/** get time item from string
+ *  parameters:
+ *  	pValue: the time string, format as hour:minute, such as 15:25
+ *  	item_name: item name in config file
+ *  	pTimeInfo: store time info
+ *  	default_hour: default hour value
+ *  	default_minute: default minute value
+ *  return: error no , 0 success, != 0 fail
+*/
+int get_time_item_from_str(const char *pValue, const char *item_name,
+        TimeInfo *pTimeInfo, const byte default_hour,
+        const byte default_minute);
 
 /** trim path tail char /
  *  parameters:
@@ -444,7 +527,17 @@ int fd_gets(int fd, char *buff, const int size, int once_bytes);
 */
 int set_rlimit(int resource, const rlim_t value);
 
-/** set non block mode
+/** fcntl add flags such as O_NONBLOCK or FD_CLOEXEC
+ *  parameters:
+ *  	fd: the fd to set
+ *  	get_cmd: the get command
+ *  	set_cmd: the set command
+ *  	adding_flags: the flags to add
+ *  return: error no , 0 success, != 0 fail
+*/
+int fcntl_add_flags(int fd, int get_cmd, int set_cmd, int adding_flags);
+
+/** set fd flags such as O_NONBLOCK
  *  parameters:
  *  	fd: the fd to set
  *  	adding_flags: the flags to add
@@ -458,6 +551,13 @@ int fd_add_flags(int fd, int adding_flags);
  *  return: error no , 0 success, != 0 fail
 */
 #define set_nonblock(fd) fd_add_flags(fd, O_NONBLOCK)
+
+/** set fd FD_CLOEXEC flags
+ *  parameters:
+ *  	fd: the fd to set
+ *  return: error no , 0 success, != 0 fail
+*/
+int fd_set_cloexec(int fd);
 
 /** set run by group and user
  *  parameters:
@@ -512,9 +612,168 @@ int set_file_utimes(const char *filename, const time_t new_time);
 */
 int ignore_signal_pipe();
 
+double get_line_distance_km(const double lat1, const double lon1,
+        const double lat2, const double lon2);
+
+/** is private ip address for IPv4
+ *  return: true for private ip, otherwise false
+ */
+bool is_private_ip(const char* ip);
+
+
+/** get current time in us
+ *  return: current time
+ */
+int64_t get_current_time_us();
+
+#define get_current_time_ms() (get_current_time_us() / 1000)
+
+/** is the number power 2
+ *  parameters:
+ *     n: the number to test
+ *  return: true for power 2, otherwise false
+*/
+bool is_power2(const int64_t n);
+
+/** set file read lock
+ *  parameters:
+ *  	fd: the file descriptor to lock
+ *  return: error no, 0 for success, != 0 fail
+*/
+int file_read_lock(int fd);
+
+/** set file write lock
+ *  parameters:
+ *  	fd: the file descriptor to lock
+ *  return: error no, 0 for success, != 0 fail
+*/
+int file_write_lock(int fd);
+
+/** file unlock
+ *  parameters:
+ *  	fd: the file descriptor to unlock
+ *  return: error no, 0 for success, != 0 fail
+*/
+int file_unlock(int fd);
+
+/** try file read lock
+ *  parameters:
+ *  	fd: the file descriptor to lock
+ *  return: error no, 0 for success, != 0 fail
+*/
+int file_try_read_lock(int fd);
+
+/** try file write lock
+ *  parameters:
+ *  	fd: the file descriptor to lock
+ *  return: error no, 0 for success, != 0 fail
+*/
+int file_try_write_lock(int fd);
+
+/** try file unlock
+ *  parameters:
+ *  	fd: the file descriptor to unlock
+ *  return: error no, 0 for success, != 0 fail
+*/
+int file_try_unlock(int fd);
+
+/** is a leading spaces line
+ *  parameters:
+ *  	content: the whole string content
+ *  	current: the current line
+ *  return: error no, 0 for success, != 0 fail
+*/
+bool isLeadingSpacesLine(const char *content, const char *current);
+
+/** is a trailing spaces line
+ *  parameters:
+ *  	tail: the current line tail
+ *  	end: the string end ptr
+ *  return: error no, 0 for success, != 0 fail
+*/
+bool isTrailingSpacesLine(const char *tail, const char *end);
+
+/** write to file
+ *  parameters:
+ *  	fd: the fd to write
+ *  	buf: the buffer
+ *  	nbyte: the buffer length
+ *  return: written bytes for success, -1 when fail
+*/
+ssize_t fc_safe_write(int fd, const char *buf, const size_t nbyte);
+
+/** lock and write to file
+ *  parameters:
+ *  	fd: the fd to write
+ *  	buf: the buffer
+ *  	nbyte: the buffer length
+ *  return: written bytes for success, -1 when fail
+*/
+ssize_t fc_lock_write(int fd, const char *buf, const size_t nbyte);
+
+/** read from file
+ *  parameters:
+ *  	fd: the fd to read
+ *  	buf: the buffer
+ *  	count: expect read bytes
+ *  return: read bytes for success, -1 when fail
+*/
+ssize_t fc_safe_read(int fd, char *buf, const size_t count);
+
+/** ftok with hash code
+ *  parameters:
+ *  	path: the file path
+ *  	proj_id: the project id
+ *  return: read bytes for success, -1 when fail
+*/
+key_t fc_ftok(const char *path, const int proj_id);
+
+/** convert int to string
+ *  parameters:
+ *  	n: the 32 bits integer
+ *      buff: output buffer
+ *      thousands_separator: if add thousands separator
+ *  return: string buffer
+*/
+const char *int2str(const int n, char *buff, const bool thousands_separator);
+
+static inline const char *int_to_comma_str(const int n, char *buff)
+{
+    return int2str(n, buff, true);
+}
+
+/** convert long to string
+ *  parameters:
+ *  	n: the 64 bits integer
+ *      buff: output buffer
+ *      thousands_separator: if add thousands separator
+ *  return: string buffer
+*/
+const char *long2str(const int64_t n, char *buff, const bool thousands_separator);
+
+static inline const char *long_to_comma_str(const int64_t n, char *buff)
+{
+    return long2str(n, buff, true);
+}
+
+/** if the string starts with the needle string
+ *  parameters:
+ *  	str: the string to detect
+ *      needle: the needle string
+ *  return: true for starts with the needle string, otherwise false
+*/
+bool starts_with(const char *str, const char *needle);
+
+/** if the string ends with the needle string
+ *  parameters:
+ *  	str: the string to detect
+ *      needle: the needle string
+ *  return: true for ends with the needle string, otherwise false
+*/
+bool ends_with(const char *str, const char *needle);
+
 #ifdef __cplusplus
 }
 #endif
 
 #endif
-

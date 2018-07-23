@@ -18,31 +18,66 @@
 
 #define FAST_INI_ITEM_NAME_LEN		64
 #define FAST_INI_ITEM_VALUE_LEN		256
+#define FAST_INI_ITEM_NAME_SIZE		(FAST_INI_ITEM_NAME_LEN + 1)
+#define FAST_INI_ITEM_VALUE_SIZE    (FAST_INI_ITEM_VALUE_LEN + 1)
 
-typedef struct
+#define FAST_INI_ANNOTATION_WITHOUT_BUILTIN 0
+#define FAST_INI_ANNOTATION_DISABLE         1
+#define FAST_INI_ANNOTATION_WITH_BUILTIN    2
+#define FAST_INI_ANNOTATION_NONE  FAST_INI_ANNOTATION_DISABLE
+
+#define FAST_INI_FLAGS_NONE            0
+#define FAST_INI_FLAGS_SHELL_EXECUTE   1
+
+typedef struct ini_item
 {
-	char name[FAST_INI_ITEM_NAME_LEN + 1];
-	char value[FAST_INI_ITEM_VALUE_LEN + 1];
+	char name[FAST_INI_ITEM_NAME_SIZE];
+	char value[FAST_INI_ITEM_VALUE_SIZE];
 } IniItem;
 
-typedef struct
+typedef struct ini_section
 {
 	IniItem *items;
 	int count;  //item count
 	int alloc_count;
 } IniSection;
 
-typedef struct
+typedef struct ini_section_info
+{
+    char section_name[FAST_INI_ITEM_NAME_SIZE];
+    IniSection *pSection;
+} IniSectionInfo;
+
+typedef struct ini_context
 {
 	IniSection global;
 	HashArray sections;  //key is session name, and value is IniSection
 	IniSection *current_section; //for load from ini file
 	char config_path[MAX_PATH_SIZE];  //save the config filepath
+    char annotation_type;
+    char flags;
 } IniContext;
+
+typedef struct ini_annotation_map {
+    char *func_name;
+    int (*func_init) ();
+    void (*func_destroy) ();
+    int (*func_get) (IniContext *context, char *param, char **pOutValue, int max_values);
+    void (*func_free) (char **values, const int count);
+} AnnotationMap;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define FAST_INI_STRING_IS_TRUE(pValue)  \
+    (strcasecmp(pValue, "true") == 0 || \
+     strcasecmp(pValue, "yes") == 0 ||  \
+     strcasecmp(pValue, "on") == 0 ||   \
+     strcmp(pValue, "1") == 0)
+
+int iniSetAnnotationCallBack(AnnotationMap *map, int count);
+void iniDestroyAnnotationCallBack();
 
 /** load ini items from file
  *  parameters:
@@ -52,6 +87,20 @@ extern "C" {
 */
 int iniLoadFromFile(const char *szFilename, IniContext *pContext);
 
+/** load ini items from file
+ *  parameters:
+ *           szFilename: the filename, can be an URL
+ *           pContext: the ini context
+ *           annotation_type: the annotation type
+ *           annotations: the annotations, can be NULL
+ *           count: the annotation count
+ *           flags: the flags
+ *  return: error no, 0 for success, != 0 fail
+*/
+int iniLoadFromFileEx(const char *szFilename, IniContext *pContext,
+    const char annotation_type, AnnotationMap *annotations, const int count,
+    const char flags);
+
 /** load ini items from string buffer
  *  parameters:
  *           content: the string buffer to parse
@@ -59,6 +108,20 @@ int iniLoadFromFile(const char *szFilename, IniContext *pContext);
  *  return: error no, 0 for success, != 0 fail
 */
 int iniLoadFromBuffer(char *content, IniContext *pContext);
+
+/** load ini items from string buffer
+ *  parameters:
+ *           content: the string buffer to parse
+ *           pContext: the ini context
+ *           annotation_type: the annotation type
+ *           annotations: the annotations, can be NULL
+ *           count: the annotation count
+ *           flags: the flags
+ *  return: error no, 0 for success, != 0 fail
+*/
+int iniLoadFromBufferEx(char *content, IniContext *pContext,
+    const char annotation_type, AnnotationMap *annotations, const int count,
+    const char flags);
 
 /** free ini context
  *  parameters:
@@ -157,6 +220,69 @@ double iniGetDoubleValue(const char *szSectionName, const char *szItemName, \
  *  return: none
 */
 void iniPrintItems(IniContext *pContext);
+
+/** return the path of config filename
+ *  parameters:
+ *           pContext:   the ini context
+ *  return: the config path
+*/
+static inline const char *iniGetConfigPath(IniContext *pContext)
+{
+	return pContext->config_path;
+}
+
+/** return the items of global section
+ *  parameters:
+ *           pContext:   the ini context
+ *           sections:   the section array
+ *           max_size:   the max size of sections
+ *           nCount:     return the section count
+ *  return: errno, 0 for success, != 0 for fail
+*/
+int iniGetSectionNames(IniContext *pContext, IniSectionInfo *sections,
+        const int max_size, int *nCount);
+
+/** return the items of global section
+ *  parameters:
+ *           pContext:   the ini context
+ *           nCount:     return the item count
+ *  return: the global items
+*/
+static inline IniItem *iniGetGlobalItems(IniContext *pContext, int *nCount)
+{
+    *nCount = pContext->global.count;
+    return pContext->global.items;
+}
+
+/** return the section items
+ *  parameters:
+ *           szSectionName: the section name, NULL or empty string for
+ *                          global section
+ *           pContext:   the ini context
+ *           nCount:     return the item count
+ *  return: the section items, NULL for not exist
+*/
+IniItem *iniGetSectionItems(const char *szSectionName, IniContext *pContext,
+        int *nCount);
+
+/** get item string value
+ *  parameters:
+ *           szSectionName: the section name, NULL or empty string for
+ *                          global section
+ *           szItemName: the item name
+ *           pContext:   the ini context
+ *           nMinLength: the min value length
+ *  return: item value, return NULL when the item not exist
+*/
+char *iniGetRequiredStrValueEx(const char *szSectionName, const char *szItemName,
+		IniContext *pContext, const int nMinLength);
+
+static inline char *iniGetRequiredStrValue(const char *szSectionName,
+        const char *szItemName, IniContext *pContext)
+{
+    const int nMinLength = 1;
+    return iniGetRequiredStrValueEx(szSectionName, szItemName, pContext, nMinLength);
+}
 
 #ifdef __cplusplus
 }

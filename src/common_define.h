@@ -48,11 +48,13 @@ typedef void * (*ThreadEntranceFunc)(LPVOID lpThreadParameter);
 extern int pthread_mutexattr_settype(pthread_mutexattr_t *attr, int kind);
 #endif
 
+#include "_os_define.h"
+
 #ifdef OS_LINUX
+#ifndef PTHREAD_MUTEX_ERRORCHECK
 #define PTHREAD_MUTEX_ERRORCHECK PTHREAD_MUTEX_ERRORCHECK_NP
 #endif
-
-#include "_os_bits.h"
+#endif
 
 #ifdef OS_BITS
   #if OS_BITS == 64
@@ -114,7 +116,21 @@ extern int pthread_mutexattr_settype(pthread_mutexattr_t *attr, int kind);
 #endif
 
 #define IS_UPPER_HEX(ch) ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F'))
+#define IS_HEX_CHAR(ch)  (IS_UPPER_HEX(ch) || (ch >= 'a' && ch <= 'f'))
+
 #define STRERROR(no) (strerror(no) != NULL ? strerror(no) : "Unkown error")
+
+#if defined(OS_LINUX)
+#if defined __USE_MISC || defined __USE_XOPEN2K8
+#define st_atimensec st_atim.tv_nsec
+#define st_mtimensec st_mtim.tv_nsec
+#define st_ctimensec st_ctim.tv_nsec
+#endif
+#elif defined(OS_FREEBSD)
+#define st_atimensec st_atimespec.tv_nsec
+#define st_mtimensec st_mtimespec.tv_nsec
+#define st_ctimensec st_ctimespec.tv_nsec
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -124,6 +140,7 @@ typedef struct
 {
 	byte hour;
 	byte minute;
+	byte second;
 } TimeInfo;
 
 typedef struct
@@ -154,6 +171,12 @@ typedef struct
 	int length;
 } BufferInfo;
 
+typedef struct
+{
+    char *str;
+    int len;
+} string_t;
+
 typedef void (*FreeDataFunc)(void *ptr);
 typedef int (*CompareFunc)(void *p1, void *p2);
 typedef void* (*MallocFunc)(size_t size);
@@ -163,6 +186,24 @@ typedef void* (*MallocFunc)(size_t size);
 
 #ifdef WIN32
 #define strcasecmp	_stricmp
+#endif
+
+#ifndef likely
+
+#if defined(__GNUC__) &&  __GNUC__ >= 3
+#define likely(cond)   __builtin_expect ((cond), 1)
+#define unlikely(cond) __builtin_expect ((cond), 0)
+#else
+#define likely(cond)   (cond)
+#define unlikely(cond) (cond)
+#endif
+
+#endif
+
+#ifdef __GNUC__
+  #define __gcc_attribute__ __attribute__
+#else
+  #define __gcc_attribute__(x)
 #endif
 
 #ifdef __cplusplus

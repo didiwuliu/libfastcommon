@@ -20,7 +20,9 @@ struct mpool_node {
 struct mpool_chain {
     struct mpool_node *head;
     struct mpool_node *tail;
-} g_mpool = {NULL, NULL};
+};
+
+static struct mpool_chain g_mpool = {NULL, NULL};
 
 #define ALIGNED_TASK_INFO_SIZE  MEM_ALIGN(sizeof(struct fast_task_info))
 
@@ -207,7 +209,7 @@ int free_queue_init_ex(const int max_connections, const int init_connections,
 		alloc_once = MAX_DATA_SIZE / g_free_queue.block_size;
         if (g_free_queue.alloc_task_once > alloc_once)
         {
-            g_free_queue.alloc_task_once = alloc_once;
+            g_free_queue.alloc_task_once = alloc_once > 0 ? alloc_once : 1;
         }
     }
     else
@@ -313,17 +315,21 @@ void free_queue_destroy()
 		char *pCharEnd;
 		struct fast_task_info *pTask;
 
-		pCharEnd = ((char *)g_mpool.head->blocks) + g_free_queue.block_size *
-				g_free_queue.alloc_connections;
-		for (p=(char *)g_mpool.head->blocks; p<pCharEnd; p += g_free_queue.block_size)
-		{
-			pTask = (struct fast_task_info *)p;
-			if (pTask->data != NULL)
-			{
-				free(pTask->data);
-				pTask->data = NULL;
-			}
-		}
+        mpool = g_mpool.head;
+        while (mpool != NULL)
+        {
+            pCharEnd = (char *)mpool->last_block + g_free_queue.block_size;
+            for (p=(char *)mpool->blocks; p<pCharEnd; p += g_free_queue.block_size)
+            {
+                pTask = (struct fast_task_info *)p;
+                if (pTask->data != NULL)
+                {
+                    free(pTask->data);
+                    pTask->data = NULL;
+                }
+            }
+            mpool = mpool->next;
+        }
 	}
 
 	mpool = g_mpool.head;
@@ -404,6 +410,8 @@ static int free_queue_realloc()
 struct fast_task_info *free_queue_pop()
 {
     struct fast_task_info *pTask;
+    int i;
+
 	if ((pTask=task_queue_pop(&g_free_queue)) != NULL)
     {
         return pTask;
@@ -414,26 +422,34 @@ struct fast_task_info *free_queue_pop()
         return NULL;
     }
 
-	pthread_mutex_lock(&g_free_queue.lock);
-    if (g_free_queue.alloc_connections >= g_free_queue.max_connections)
+    for (i=0; i<10; i++)
     {
-        if (g_free_queue.head == NULL)
+        pthread_mutex_lock(&g_free_queue.lock);
+        if (g_free_queue.alloc_connections >= g_free_queue.max_connections)
         {
-            pthread_mutex_unlock(&g_free_queue.lock);
-            return NULL;
+            if (g_free_queue.head == NULL)
+            {
+                pthread_mutex_unlock(&g_free_queue.lock);
+                return NULL;
+            }
         }
-    }
-    else
-    {
-        if (free_queue_realloc() != 0)
+        else
         {
-            pthread_mutex_unlock(&g_free_queue.lock);
-            return NULL;
+            if (g_free_queue.head == NULL && free_queue_realloc() != 0)
+            {
+                pthread_mutex_unlock(&g_free_queue.lock);
+                return NULL;
+            }
         }
-    }
-	pthread_mutex_unlock(&g_free_queue.lock);
+        pthread_mutex_unlock(&g_free_queue.lock);
 
-    return task_queue_pop(&g_free_queue);
+        if ((pTask=task_queue_pop(&g_free_queue)) != NULL)
+        {
+            return pTask;
+        }
+    }
+
+    return NULL;
 }
 
 static int _realloc_buffer(struct fast_task_info *pTask, const int new_size,
@@ -629,40 +645,44 @@ int task_queue_count(struct fast_task_queue *pQueue)
 	return count;
 }
 
-static int _get_new_buffer_size(struct fast_task_queue *pQueue,
-        const int expect_size, int *new_size)
+int task_queue_get_new_buffer_size(const int min_buff_size,
+        const int max_buff_size, const int expect_size, int *new_size)
 {
-    if (pQueue->min_buff_size == pQueue->max_buff_size)
+    if (min_buff_size == max_buff_size)
     {
         logError("file: "__FILE__", line: %d, "
                 "can't change buffer size because NOT supported", __LINE__);
         return EOPNOTSUPP;
     }
 
-    if (expect_size > pQueue->max_buff_size)
+    if (expect_size > max_buff_size)
     {
         logError("file: "__FILE__", line: %d, "
                 "can't change buffer size because expect buffer size: %d "
                 "exceeds max buffer size: %d", __LINE__, expect_size,
-                pQueue->max_buff_size);
+                max_buff_size);
         return EOVERFLOW;
     }
 
-    *new_size = pQueue->min_buff_size;
-    if (expect_size > pQueue->min_buff_size)
+    *new_size = min_buff_size;
+    if (expect_size > min_buff_size)
     {
         while (*new_size < expect_size)
         {
             *new_size *= 2;
         }
-        if (*new_size > pQueue->max_buff_size)
+        if (*new_size > max_buff_size)
         {
-            *new_size = pQueue->max_buff_size;
+            *new_size = max_buff_size;
         }
     }
 
     return 0;
 }
+
+#define  _get_new_buffer_size(pQueue, expect_size, new_size) \
+    task_queue_get_new_buffer_size(pQueue->min_buff_size, \
+            pQueue->max_buff_size, expect_size, new_size)
 
 int task_queue_set_buffer_size(struct fast_task_queue *pQueue,
         struct fast_task_info *pTask, const int expect_size)

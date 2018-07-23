@@ -71,25 +71,30 @@ static int _hash_alloc_buckets(HashArray *pHash, const unsigned int old_capacity
 	return 0;
 }
 
-int hash_init_ex(HashArray *pHash, HashFunc hash_func, \
-		const unsigned int capacity, const double load_factor, \
-		const int64_t max_bytes, const bool bMallocValue)
+unsigned int *hash_get_prime_capacity(const int capacity)
 {
 	unsigned int *pprime;
 	unsigned int *prime_end;
-	int result;
-
-	memset(pHash, 0, sizeof(HashArray));
 	prime_end = prime_array + PRIME_ARRAY_SIZE;
 	for (pprime = prime_array; pprime!=prime_end; pprime++)
 	{
 		if (*pprime > capacity)
 		{
-			pHash->capacity = pprime;
-			break;
+            return pprime;
 		}
 	}
 
+    return NULL;
+}
+
+int hash_init_ex(HashArray *pHash, HashFunc hash_func, \
+		const unsigned int capacity, const double load_factor, \
+		const int64_t max_bytes, const bool bMallocValue)
+{
+	int result;
+
+	memset(pHash, 0, sizeof(HashArray));
+    pHash->capacity = hash_get_prime_capacity(capacity);
 	if (pHash->capacity == NULL)
 	{
 		return EINVAL;
@@ -132,6 +137,7 @@ int hash_set_locks(HashArray *pHash, const int lock_count)
 		return EINVAL;
 	}
 
+    //do NOT support rehash
 	if (pHash->load_factor >= 0.10)
 	{
 		return EINVAL;
@@ -367,20 +373,7 @@ static int _rehash(HashArray *pHash)
 	pOldCapacity = pHash->capacity;
 	if (pHash->is_malloc_capacity)
 	{
-		unsigned int *pprime;
-		unsigned int *prime_end;
-
-		pHash->capacity = NULL;
-
-		prime_end = prime_array + PRIME_ARRAY_SIZE;
-		for (pprime = prime_array; pprime!=prime_end; pprime++)
-		{
-			if (*pprime > *pOldCapacity)
-			{
-				pHash->capacity = pprime;
-				break;
-			}
-		}
+        pHash->capacity = hash_get_prime_capacity(*pOldCapacity);
 	}
 	else
 	{
@@ -1377,7 +1370,7 @@ static unsigned int crc_table[256] = {
 #define CRC32_BODY(init_value) \
 	unsigned char *pKey; \
 	unsigned char *pEnd; \
-	int crc; \
+	int64_t crc; \
  \
 	crc = init_value; \
 	pEnd = (unsigned char *)key + key_len; \
@@ -1386,18 +1379,17 @@ static unsigned int crc_table[256] = {
 		crc = crc_table[(crc ^ *pKey) & 0xFF] ^ (crc >> 8); \
 	} \
 
-int CRC32(void *key, const int key_len)
+int CRC32(const void *key, const int key_len)
 {
 	CRC32_BODY(CRC32_XINIT)
 
-	return crc ^ CRC32_XOROT;
+	return (int)(crc ^ CRC32_XOROT);
 }
 
-int CRC32_ex(void *key, const int key_len, \
-	const int init_value)
+int64_t CRC32_ex(const void *key, const int key_len, \
+	const int64_t init_value)
 {
 	CRC32_BODY(init_value)
 
 	return crc;
 }
-

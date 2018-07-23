@@ -56,7 +56,7 @@ int insert_into_local_host_ip(const char *client_ip)
 	return 1;
 }
 
-static void log_local_host_ip_addrs()
+void log_local_host_ip_addrs()
 {
 	char *p;
 	char *pEnd;
@@ -83,7 +83,7 @@ void load_local_host_ip_addrs()
 	char *if_alias_prefixes[STORAGE_MAX_ALIAS_PREFIX_COUNT];
 	int alias_count;
 
-	insert_into_local_host_ip("127.0.0.1");
+	insert_into_local_host_ip(LOCAL_LOOPBACK_IP);
 
 	memset(if_alias_prefixes, 0, sizeof(if_alias_prefixes));
 	if (*g_if_alias_prefix == '\0')
@@ -96,7 +96,7 @@ void load_local_host_ip_addrs()
 			if_alias_prefixes, STORAGE_MAX_ALIAS_PREFIX_COUNT);
 		for (k=0; k<alias_count; k++)
 		{
-			trim(if_alias_prefixes[k]);
+			fc_trim(if_alias_prefixes[k]);
 		}
 	}
 
@@ -111,7 +111,7 @@ void load_local_host_ip_addrs()
 		insert_into_local_host_ip(ip_addresses[k]);
 	}
 
-	log_local_host_ip_addrs();
+	//log_local_host_ip_addrs();
 	//print_local_host_ip_addrs();
 }
 
@@ -130,5 +130,72 @@ void print_local_host_ip_addrs()
 	}
 
 	printf("\n");
+}
+
+const char *get_next_local_ip(const char *previous_ip)
+{
+    char *p;
+	char *pEnd;
+    bool found;
+
+    if (g_local_host_ip_count == 0)
+    {
+        load_local_host_ip_addrs();
+    }
+
+    found = (previous_ip == NULL);
+	pEnd = g_local_host_ip_addrs + \
+		IP_ADDRESS_SIZE * g_local_host_ip_count;
+	for (p=g_local_host_ip_addrs; p<pEnd; p+=IP_ADDRESS_SIZE)
+	{
+	    if (strcmp(p, LOCAL_LOOPBACK_IP) != 0)
+        {
+            if (found)
+            {
+                return p;
+            }
+            else if (strcmp(p, previous_ip) == 0)
+            {
+                found = true;
+            }
+        }
+	}
+
+    return NULL;
+}
+
+const char *get_first_local_ip()
+{
+    const char *first_ip;
+    first_ip = get_next_local_ip(NULL);
+    if (first_ip != NULL)
+    {
+        return first_ip;
+    }
+    else
+    {
+        return LOCAL_LOOPBACK_IP;
+    }
+}
+
+const char *get_first_local_private_ip()
+{
+    const char *ip;
+
+    ip = NULL;
+    do
+    {
+        ip = get_next_local_ip(ip);
+        if (ip == NULL)
+        {
+            return NULL;
+        }
+        if (is_private_ip(ip))
+        {
+            return ip;
+        }
+    } while (1);
+
+    return NULL;
 }
 

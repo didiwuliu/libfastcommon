@@ -13,16 +13,12 @@
 #include <string.h>
 #include <errno.h>
 #include <time.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
-#include <net/if.h>
 
 #if defined(OS_LINUX) || defined(OS_FREEBSD)
 #include <ifaddrs.h>
@@ -42,7 +38,9 @@
 #include <sys/sendfile.h>
 #else
 #ifdef OS_FREEBSD
+#include <sys/sysctl.h>
 #include <sys/uio.h>
+#include <net/if_dl.h>
 #endif
 #endif
 
@@ -338,13 +336,13 @@ int tcprecvdata_nb_ms(int sock, void *data, const int size, \
 		}
 
 #ifdef USE_SELECT
-		if (timeout <= 0)
+		if (timeout_ms <= 0)
 		{
 			res = select(sock+1, &read_set, NULL, NULL, NULL);
 		}
 		else
 		{
-			t.tv_usec = timeout_ms * 1000;
+			t.tv_usec = (timeout_ms % 1000) * 1000;
 			t.tv_sec = timeout_ms / 1000;
 			res = select(sock+1, &read_set, NULL, NULL, &t);
 		}
@@ -457,21 +455,55 @@ int tcpsenddata_nb(int sock, void* data, const int size, const int timeout)
 	return 0;
 }
 
+int setsockaddrbyip(const char *ip, const short port, struct sockaddr_in *addr,
+        struct sockaddr_in6 *addr6, void **output, int *size)
+{
+    int domain;
+    void *dest;
+
+    if (is_ipv6_addr(ip))
+    {
+        *output = addr6;
+        *size = sizeof(*addr6);
+        dest = &addr6->sin6_addr;
+
+        domain = AF_INET6;
+        addr6->sin6_family = PF_INET6;
+        addr6->sin6_port = htons(port);
+    }
+    else  //ipv4
+    {
+        *output = addr;
+        *size = sizeof(*addr);
+        dest = &addr->sin_addr;
+
+        domain = AF_INET;
+        addr->sin_family = PF_INET;
+        addr->sin_port = htons(port);
+    }
+
+    if (inet_pton(domain, ip, dest) == 0)
+    {
+        return EINVAL;
+    }
+    return 0;
+}
+
 int connectserverbyip(int sock, const char *server_ip, const short server_port)
 {
-	int result;
+    int result;
 	struct sockaddr_in addr;
+	struct sockaddr_in6 addr6;
+    void *dest;
+    int size;
 
-	addr.sin_family = PF_INET;
-	addr.sin_port = htons(server_port);
-	result = inet_aton(server_ip, &addr.sin_addr);
-	if (result == 0 )
-	{
-		return EINVAL;
-	}
+    if ((result=setsockaddrbyip(server_ip, server_port, &addr, &addr6,
+                    &dest, &size)) != 0)
+    {
+        return result;
+    }
 
-	result = connect(sock, (const struct sockaddr*)&addr, sizeof(addr));
-	if (result < 0)
+	if (connect(sock, (const struct sockaddr*)dest, size) < 0)
 	{
 		return errno != 0 ? errno : EINTR;
 	}
@@ -497,14 +529,15 @@ int connectserverbyip_nb_ex(int sock, const char *server_ip, \
 #endif
 
 	struct sockaddr_in addr;
+	struct sockaddr_in6 addr6;
+    void *dest;
+    int size;
 
-	addr.sin_family = PF_INET;
-	addr.sin_port = htons(server_port);
-	result = inet_aton(server_ip, &addr.sin_addr);
-	if (result == 0 )
-	{
-		return EINVAL;
-	}
+    if ((result=setsockaddrbyip(server_ip, server_port, &addr, &addr6,
+                    &dest, &size)) != 0)
+    {
+        return result;
+    }
 
 	if (auto_detect)
 	{
@@ -536,8 +569,7 @@ int connectserverbyip_nb_ex(int sock, const char *server_ip, \
 
 	do
 	{
-		if (connect(sock, (const struct sockaddr*)&addr, \
-			sizeof(addr)) < 0)
+		if (connect(sock, (const struct sockaddr*)dest, size) < 0)
 		{
 			result = errno != 0 ? errno : EINPROGRESS;
 			if (result != EINPROGRESS)
@@ -651,7 +683,7 @@ char *getHostnameByIp(const char *szIpAddr, char *buff, const int bufferSize)
 
 in_addr_t getIpaddrByName(const char *name, char *buff, const int bufferSize)
 {
-  struct in_addr ip_addr;
+	struct in_addr ip_addr;
 	struct hostent *ent;
 	in_addr_t **addr_list;
 
@@ -671,7 +703,7 @@ in_addr_t getIpaddrByName(const char *name, char *buff, const int bufferSize)
 		return INADDR_NONE;
 	}
 
-        addr_list = (in_addr_t **)ent->h_addr_list;
+    addr_list = (in_addr_t **)ent->h_addr_list;
 	if (addr_list[0] == NULL)
 	{
 		return INADDR_NONE;
@@ -688,6 +720,65 @@ in_addr_t getIpaddrByName(const char *name, char *buff, const int bufferSize)
 	}
 
 	return ip_addr.s_addr;
+}
+
+int getIpaddrsByName(const char *name,
+    ip_addr_t *ip_addr_arr, const int ip_addr_arr_size)
+{
+    int ip_count;
+    struct sockaddr_in *addr;
+    struct sockaddr_in6 *addr6;
+    struct addrinfo hints, *res, *res0;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = PF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(name, NULL, &hints, &res0) != 0) {
+        return 0;
+    }
+
+    for (ip_count = 0, res = res0; res; res = res->ai_next) {
+        if (res->ai_family != AF_INET6 && res->ai_family != AF_INET) {
+            logError("file: "__FILE__", line: %d, " \
+                     "unsupported family %d, " \
+                     "only suppport AF_INET6 and AF_INET", \
+                     __LINE__, res->ai_family);
+            continue;
+        }
+
+        if (ip_addr_arr_size <= ip_count) {
+            break;
+        }
+
+        if (res->ai_family == AF_INET6) {
+            addr6 = (struct sockaddr_in6 *) res->ai_addr;
+            if (inet_ntop(res->ai_family, &addr6->sin6_addr,
+                    ip_addr_arr[ip_count].ip_addr, INET6_ADDRSTRLEN) == NULL)
+            {
+                logError("file: "__FILE__", line: %d, " \
+                         "inet_ntop failed: %d, %s", \
+                         __LINE__, errno, strerror(errno));
+                continue;
+            }
+        } else {
+            addr = (struct sockaddr_in *) res->ai_addr;
+            if (inet_ntop(res->ai_family, &addr->sin_addr,
+                    ip_addr_arr[ip_count].ip_addr, INET6_ADDRSTRLEN) == NULL)
+            {
+                logError("file: "__FILE__", line: %d, " \
+                         "inet_ntop failed: %d, %s", \
+                         __LINE__, errno, strerror(errno));
+                continue;
+            }
+        }
+
+        ip_addr_arr[ip_count++].socket_domain = res->ai_family;
+    }
+
+    freeaddrinfo(res0);
+
+	return ip_count;
 }
 
 int nbaccept(int sock, const int timeout, int *err_no)
@@ -753,7 +844,7 @@ int socketBind(int sock, const char *bind_ipaddr, const int port)
 	}
 	else
 	{
-		if (inet_aton(bind_ipaddr, &bindaddr.sin_addr) == 0)
+		if (inet_pton(AF_INET, bind_ipaddr, &bindaddr.sin_addr) == 0)
 		{
 			logError("file: "__FILE__", line: %d, " \
 				"invalid ip addr %s", \
@@ -788,6 +879,8 @@ int socketServer(const char *bind_ipaddr, const int port, int *err_no)
 			__LINE__, errno, STRERROR(errno));
 		return -1;
 	}
+
+    SET_SOCKOPT_NOSIGPIPE(sock);
 
 	result = 1;
 	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &result, sizeof(int))<0)
@@ -826,7 +919,7 @@ int tcprecvfile(int sock, const char *filename, const int64_t file_bytes, \
 		int64_t *true_file_bytes)
 {
 	int write_fd;
-	char buff[FDFS_WRITE_BUFF_SIZE];
+	char buff[FAST_WRITE_BUFF_SIZE];
 	int64_t remain_bytes;
 	int recv_bytes;
 	int written_bytes;
@@ -979,7 +1072,7 @@ int tcprecvfile_ex(int sock, const char *filename, const int64_t file_bytes, \
 		unsigned int *hash_codes, const int timeout)
 {
 	int fd;
-	char buff[FDFS_WRITE_BUFF_SIZE];
+	char buff[FAST_WRITE_BUFF_SIZE];
 	int64_t remain_bytes;
 	int recv_bytes;
 	int written_bytes;
@@ -1070,7 +1163,7 @@ int tcprecvfile_ex(int sock, const char *filename, const int64_t file_bytes, \
 int tcpdiscard(int sock, const int bytes, const int timeout, \
 		int64_t *total_recv_bytes)
 {
-	char buff[FDFS_WRITE_BUFF_SIZE];
+	char buff[FAST_WRITE_BUFF_SIZE];
 	int remain_bytes;
 	int recv_bytes;
 	int result;
@@ -1238,7 +1331,7 @@ int tcpsendfile_ex(int sock, const char *filename, const int64_t file_offset, \
                 break;
             }
         }
-        remain_bytes -= fsbytes;
+        remain_bytes -= sbytes;
     }
 #endif
 #endif
@@ -1267,7 +1360,7 @@ int tcpsendfile_ex(int sock, const char *filename, const int64_t file_offset, \
 #endif
 
 	{
-	char buff[FDFS_WRITE_BUFF_SIZE];
+	char buff[FAST_WRITE_BUFF_SIZE];
 	int64_t remain_bytes;
 	tcpsenddatafunc send_func;
 
@@ -1330,6 +1423,8 @@ int tcpsetserveropt(int fd, const int timeout)
 
 	struct linger linger;
 	struct timeval waittime;
+
+    SET_SOCKOPT_NOSIGPIPE(fd);
 
 /*
 	linger.l_onoff = 1;
@@ -1568,36 +1663,36 @@ int getlocaladdrs(char ip_addrs[][IP_ADDRESS_SIZE], \
 
 	ifc1 = ifc;
 	while (NULL != ifc)
-	{
-		struct sockaddr *s;
-		s = ifc->ifa_addr;
-		if (NULL != s && AF_INET == s->sa_family)
-		{
-			if (max_count <= *count)
-			{
-				logError("file: "__FILE__", line: %d, "\
-				"max_count: %d < iterface count: %d", \
-				__LINE__, max_count, *count);
-				freeifaddrs(ifc1);
-				return ENOSPC;
-			}
+    {
+        struct sockaddr *s;
+        s = ifc->ifa_addr;
+        if (NULL != s && AF_INET == s->sa_family)
+        {
+            if (max_count <= *count)
+            {
+                logError("file: "__FILE__", line: %d, "\
+                        "max_count: %d < iterface count: %d", \
+                        __LINE__, max_count, *count);
+                freeifaddrs(ifc1);
+                return ENOSPC;
+            }
 
-			if (inet_ntop(AF_INET, &((struct sockaddr_in *)s)-> \
-			sin_addr, ip_addrs[*count], IP_ADDRESS_SIZE) != NULL)
-			{
-				(*count)++;
-			}
-			else
-			{
-				logWarning("file: "__FILE__", line: %d, " \
-					"call inet_ntop fail, " \
-					"errno: %d, error info: %s", \
-					__LINE__, errno, STRERROR(errno));
-			}
-		}
+            if (inet_ntop(AF_INET, &((struct sockaddr_in *)s)-> \
+                        sin_addr, ip_addrs[*count], IP_ADDRESS_SIZE) != NULL)
+            {
+                (*count)++;
+            }
+            else
+            {
+                logWarning("file: "__FILE__", line: %d, " \
+                        "call inet_ntop fail, " \
+                        "errno: %d, error info: %s", \
+                        __LINE__, errno, STRERROR(errno));
+            }
+        }
 
-		ifc = ifc->ifa_next;
-	}
+        ifc = ifc->ifa_next;
+    }
 
 	freeifaddrs(ifc1);
 	return *count > 0 ? 0 : ENOENT;
@@ -1611,12 +1706,12 @@ int getlocaladdrs(char ip_addrs[][IP_ADDRESS_SIZE], \
 	int s;
 	struct ifconf ifconf;
 	struct ifreq ifr[32];
-	int if_count;
-	int i;
+	struct ifreq *ifrp;
+	char *p_end;
 	int result;
 
 	*count = 0;
-	s = socket(AF_INET, SOCK_STREAM, 0);
+	s = socket(AF_INET, SOCK_DGRAM, 0);
 	if (s < 0)
 	{
 		logError("file: "__FILE__", line: %d, " \
@@ -1637,32 +1732,44 @@ int getlocaladdrs(char ip_addrs[][IP_ADDRESS_SIZE], \
 		return result;
 	}
 
-	if_count = ifconf.ifc_len / sizeof(ifr[0]);
-	if (max_count < if_count)
+	ifrp = ifconf.ifc_req;
+	p_end = (char *)ifr + ifconf.ifc_len;
+	while ((char *)ifrp < p_end)
 	{
-		logError("file: "__FILE__", line: %d, " \
-			"max_count: %d < iterface count: %d", \
-			__LINE__, max_count, if_count);
- 		close(s);
-		return ENOSPC;
-	}
-
-	for (i = 0; i < if_count; i++)
-	{
+		struct sockaddr *sa = &ifrp->ifr_addr;
 		struct sockaddr_in *s_in;
-    		s_in = (struct sockaddr_in *) &ifr[i].ifr_addr;
-    		if (!inet_ntop(AF_INET, &s_in->sin_addr, \
-			ip_addrs[*count], IP_ADDRESS_SIZE))
+
+		if (*count >= max_count)
 		{
-			result = errno != 0 ? errno : EMFILE;
 			logError("file: "__FILE__", line: %d, " \
-				"call inet_ntop fail, " \
-				"errno: %d, error info: %s", \
-				__LINE__, result, STRERROR(result));
- 			close(s);
-			return result;
-    		}
-		(*count)++;
+					"max_count: %d < iterface count: %d", \
+					__LINE__, max_count, *count);
+			close(s);
+			return ENOSPC;
+		}
+
+        s_in = (struct sockaddr_in *) &ifrp->ifr_addr;
+		if (sa->sa_family == AF_INET)
+        {
+            if (!inet_ntop(AF_INET, &s_in->sin_addr, \
+                        ip_addrs[*count], IP_ADDRESS_SIZE))
+            {
+                result = errno != 0 ? errno : EMFILE;
+                logError("file: "__FILE__", line: %d, " \
+                        "call inet_ntop fail, " \
+                        "errno: %d, error info: %s", \
+                        __LINE__, result, STRERROR(result));
+                close(s);
+                return result;
+            }
+            (*count)++;
+        }
+
+#ifdef OS_FREEBSD
+		ifrp = (struct ifreq*)((caddr_t)&ifrp->ifr_addr + sa->sa_len);
+#else
+        ifrp++;
+#endif
 	}
 
 	close(s);
@@ -1800,4 +1907,201 @@ int gethostaddrs(char **if_alias_prefixes, const int prefix_count, \
 
 	return 0;
 }
+
+#if defined(OS_LINUX) || defined(OS_FREEBSD)
+
+static inline void formatifmac(char *buff, const int buff_size, unsigned char *hwaddr)
+{
+    int i;
+    for (i=0; i<6; i++)
+    {
+        if (hwaddr[i] != 0)
+        {
+            break;
+        }
+    }
+
+    if (i == 6)
+    {
+        *buff = '\0';
+        return;
+    }
+
+    snprintf(buff, buff_size,
+            "%02X:%02X:%02X:%02X:%02X:%02X",
+            *hwaddr, *(hwaddr+1), *(hwaddr+2),
+            *(hwaddr+3), *(hwaddr+4), *(hwaddr+5));
+}
+
+#if defined(OS_LINUX)
+static int getifmac(FastIFConfig *config)
+{
+    int sockfd;
+    struct ifreq req[1];
+
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0)
+    {
+        logError("file: "__FILE__", line: %d, "
+                "unable to create socket, "
+                "errno: %d, error info: %s",
+                __LINE__, errno, STRERROR(errno));
+        return errno != 0 ? errno : EPERM;
+    }
+
+    memset(req, 0, sizeof(struct ifreq));
+    strcpy(req->ifr_name, config->name);
+    if (ioctl(sockfd, SIOCGIFHWADDR, req) < 0)
+    {
+        logError("file: "__FILE__", line: %d, "
+                "ioctl error, errno: %d, error info: %s",
+                __LINE__, errno, STRERROR(errno));
+        close(sockfd);
+        return errno != 0 ? errno : EPERM;
+    }
+
+    close(sockfd);
+    formatifmac(config->mac, sizeof(config->mac),
+            (unsigned char *)req->ifr_hwaddr.sa_data);
+    return 0;
+}
+#else  //FreeBSD
+static int getifmac(FastIFConfig *config)
+{
+    int                 mib[6];
+    size_t              len;
+    char                buf[256];
+    unsigned char       *ptr;
+    struct if_msghdr    *ifm;
+    struct sockaddr_dl  *sdl;
+
+    mib[0] = CTL_NET;
+    mib[1] = AF_ROUTE;
+    mib[2] = 0;
+    mib[3] = AF_LINK;
+    mib[4] = NET_RT_IFLIST;
+
+    if ((mib[5] = if_nametoindex(config->name)) == 0)
+    {
+        logError("file: "__FILE__", line: %d, "
+                "call if_nametoindex fail, "
+                "errno: %d, error info: %s",
+                __LINE__, errno, STRERROR(errno));
+        return errno != 0 ? errno : EPERM;
+    }
+
+    len = sizeof(buf);
+    if (sysctl(mib, 6, buf, &len, NULL, 0) < 0)
+    {
+        logError("file: "__FILE__", line: %d, "
+                "call sysctl fail, "
+                "errno: %d, error info: %s",
+                __LINE__, errno, STRERROR(errno));
+        return errno != 0 ? errno : EPERM;
+    }
+
+    ifm = (struct if_msghdr *)buf;
+    sdl = (struct sockaddr_dl *)(ifm + 1);
+    ptr = (unsigned char *)LLADDR(sdl);
+    formatifmac(config->mac, sizeof(config->mac), ptr);
+    return 0;
+}
+#endif
+
+int getifconfigs(FastIFConfig *if_configs, const int max_count, int *count)
+{
+	struct ifaddrs *ifc;
+	struct ifaddrs *ifc1;
+    FastIFConfig *config;
+    char *buff;
+    int buff_size;
+    int i;
+
+	*count = 0;
+    memset(if_configs, 0, sizeof(FastIFConfig) * max_count);
+	if (0 != getifaddrs(&ifc))
+	{
+		logError("file: "__FILE__", line: %d, " \
+			"call getifaddrs fail, " \
+			"errno: %d, error info: %s", \
+			__LINE__, errno, STRERROR(errno));
+		return errno != 0 ? errno : EMFILE;
+	}
+
+	ifc1 = ifc;
+	while (NULL != ifc)
+	{
+		struct sockaddr *s;
+		s = ifc->ifa_addr;
+		if (NULL != s)
+        {
+            if (AF_INET == s->sa_family || AF_INET6 == s->sa_family)
+            {
+                for (i=0; i<*count; i++)
+                {
+                    if (strcmp(if_configs[i].name, ifc->ifa_name) == 0)
+                    {
+                        break;
+                    }
+                }
+
+                config = if_configs + i;
+                if (i == *count)  //not found
+                {
+                    if (max_count <= *count)
+                    {
+                        logError("file: "__FILE__", line: %d, "\
+                                "max_count: %d < iterface count: %d", \
+                                __LINE__, max_count, *count);
+                        freeifaddrs(ifc1);
+                        return ENOSPC;
+                    }
+
+                    sprintf(config->name, "%s", ifc->ifa_name);
+                    (*count)++;
+                }
+
+                if (AF_INET == s->sa_family)
+                {
+                    buff = config->ipv4;
+                    buff_size = sizeof(config->ipv4);
+                }
+                else
+                {
+                    buff = config->ipv6;
+                    buff_size = sizeof(config->ipv6);
+                }
+
+                if (inet_ntop(s->sa_family, &((struct sockaddr_in *)s)->
+                            sin_addr, buff, buff_size) == NULL)
+                {
+                    logWarning("file: "__FILE__", line: %d, " \
+                            "call inet_ntop fail, " \
+                            "errno: %d, error info: %s", \
+                            __LINE__, errno, STRERROR(errno));
+                }
+            }
+        }
+
+		ifc = ifc->ifa_next;
+	}
+
+	freeifaddrs(ifc1);
+
+    for (i=0; i<*count; i++)
+    {
+        getifmac(if_configs + i);
+    }
+
+    return 0;
+}
+
+#else
+
+int getifconfigs(FastIFConfig *if_configs, const int max_count, int *count)
+{
+    *count = 0;
+    return EOPNOTSUPP;
+}
+#endif
 

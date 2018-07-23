@@ -10,16 +10,26 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
-#include "sched_thread.h"
 #include "shared_func.h"
 #include "pthread_func.h"
 #include "logger.h"
+#include "sched_thread.h"
 
 volatile bool g_schedule_flag = false;
 volatile time_t g_current_time = 0;
 
 static ScheduleArray waiting_schedule_array = {NULL, 0};
 static int waiting_del_id = -1;
+
+static ScheduleContext *schedule_context = NULL;
+static int timer_slot_count = 0;
+static int mblock_alloc_once = 0;
+static uint32_t next_id = 0;
+static bool print_all_entries = false;
+
+static void sched_deal_delay_tasks(ScheduleContext *pContext);
+static int sched_dup_array(const ScheduleArray *pSrcArray,
+		ScheduleArray *pDestArray);
 
 static int sched_cmp_by_next_call_time(const void *p1, const void *p2)
 {
@@ -34,6 +44,8 @@ static int sched_init_entries(ScheduleArray *pScheduleArray)
 	time_t time_base;
 	struct tm tm_current;
 	struct tm tm_base;
+    int remain;
+    int interval;
 
 	if (pScheduleArray->count < 0)
 	{
@@ -52,6 +64,11 @@ static int sched_init_entries(ScheduleArray *pScheduleArray)
 	pEnd = pScheduleArray->entries + pScheduleArray->count;
 	for (pEntry=pScheduleArray->entries; pEntry<pEnd; pEntry++)
 	{
+        if (next_id < pEntry->id)
+        {
+            next_id = pEntry->id;
+        }
+
 		if (pEntry->interval <= 0)
 		{
 			logError("file: "__FILE__", line: %d, " \
@@ -81,12 +98,30 @@ static int sched_init_entries(ScheduleArray *pScheduleArray)
 
 			tm_base.tm_hour = pEntry->time_base.hour;
 			tm_base.tm_min = pEntry->time_base.minute;
-			tm_base.tm_sec = 0;
+            if (pEntry->time_base.second >= 0 && pEntry->time_base.second <= 59)
+            {
+                tm_base.tm_sec = pEntry->time_base.second;
+            }
+            else
+            {
+                tm_base.tm_sec = 0;
+            }
 			time_base = mktime(&tm_base);
+            remain = g_current_time - time_base;
+            if (remain > 0)
+            {
+                interval = pEntry->interval - remain % pEntry->interval;
+            }
+            else if (remain < 0)
+            {
+                interval = (-1 * remain) % pEntry->interval;
+            }
+            else
+            {
+                interval = 0;
+            }
 
-			pEntry->next_call_time = g_current_time + \
-				pEntry->interval - (g_current_time - \
-					time_base) % pEntry->interval;
+			pEntry->next_call_time = g_current_time + interval;
 		}
 
 		/*
@@ -130,7 +165,62 @@ static void sched_make_chain(ScheduleContext *pContext)
 	pContext->tail->next = NULL;
 }
 
-static int sched_check_waiting(ScheduleContext *pContext)
+void sched_print_all_entries()
+{
+    print_all_entries = true;
+}
+
+static int sched_cmp_by_id(const void *p1, const void *p2)
+{
+	return (int64_t)((ScheduleEntry *)p1)->id -
+        (int64_t)((ScheduleEntry *)p2)->id;
+}
+
+static int print_all_sched_entries(ScheduleArray *pScheduleArray)
+{
+    ScheduleArray sortedByIdArray;
+	ScheduleEntry *pEntry;
+	ScheduleEntry *pEnd;
+    char timebase[32];
+    int result;
+
+    logInfo("schedule entry count: %d", pScheduleArray->count);
+	if (pScheduleArray->count == 0)
+	{
+		return 0;
+	}
+
+    if ((result=sched_dup_array(pScheduleArray, &sortedByIdArray)) != 0)
+    {
+        return result;
+    }
+
+    qsort(sortedByIdArray.entries, sortedByIdArray.count,
+            sizeof(ScheduleEntry), sched_cmp_by_id);
+	pEnd = sortedByIdArray.entries + sortedByIdArray.count;
+	for (pEntry=sortedByIdArray.entries; pEntry<pEnd; pEntry++)
+	{
+        if (pEntry->time_base.hour == TIME_NONE)
+        {
+            strcpy(timebase, "<startup>");
+        }
+        else
+        {
+            sprintf(timebase, "%02d:%02d:%02d", pEntry->time_base.hour,
+                pEntry->time_base.minute, pEntry->time_base.second);
+        }
+        logInfo("id: %u, time_base: %s, interval: %d, "
+                "new_thread: %s, task_func: %p, args: %p",
+                pEntry->id, timebase, pEntry->interval,
+                pEntry->new_thread ? "true" : "false",
+                pEntry->task_func, pEntry->func_args);
+    }
+
+    free(sortedByIdArray.entries);
+    return 0;
+}
+
+static int do_check_waiting(ScheduleContext *pContext)
 {
 	ScheduleArray *pScheduleArray;
 	ScheduleEntry *newEntries;
@@ -259,6 +349,43 @@ static int sched_check_waiting(ScheduleContext *pContext)
 	return 0;
 }
 
+static inline int sched_check_waiting_more(ScheduleContext *pContext)
+{
+	int result;
+
+    result = do_check_waiting(pContext);
+    if (print_all_entries)
+    {
+        print_all_sched_entries(&pContext->scheduleArray);
+        print_all_entries = false;
+    }
+    return result;
+}
+
+static void *sched_call_func(void *args)
+{
+	ScheduleEntry *pEntry;
+    void *func_args;
+    TaskFunc task_func;
+    int task_id;
+
+    pEntry = (ScheduleEntry *)args;
+    task_func = pEntry->task_func;
+    func_args = pEntry->func_args;
+    task_id = pEntry->id;
+
+    logDebug("file: "__FILE__", line: %d, " \
+            "thread enter, task id: %d", __LINE__, task_id);
+
+    pEntry->thread_running = true;
+    task_func(func_args);
+
+    logDebug("file: "__FILE__", line: %d, " \
+            "thread exit, task id: %d", __LINE__, task_id);
+    pthread_detach(pthread_self());
+	return NULL;
+}
+
 static void *sched_thread_entrance(void *args)
 {
 	ScheduleContext *pContext;
@@ -281,21 +408,24 @@ static void *sched_thread_entrance(void *args)
 	g_schedule_flag = true;
 	while (*(pContext->pcontinue_flag))
 	{
-		sched_check_waiting(pContext);
+		g_current_time = time(NULL);
+        sched_deal_delay_tasks(pContext);
+
+		sched_check_waiting_more(pContext);
 		if (pContext->scheduleArray.count == 0)  //no schedule entry
 		{
 			sleep(1);
-			g_current_time = time(NULL);
 			continue;
 		}
 
-		g_current_time = time(NULL);
         while (pContext->head->next_call_time > g_current_time &&
                 *(pContext->pcontinue_flag))
         {
             sleep(1);
             g_current_time = time(NULL);
-            if (sched_check_waiting(pContext) == 0)
+
+            sched_deal_delay_tasks(pContext);
+            if (sched_check_waiting_more(pContext) == 0)
             {
                 break;
             }
@@ -311,8 +441,38 @@ static void *sched_thread_entrance(void *args)
 		while (*(pContext->pcontinue_flag) && (pCurrent != NULL \
 			&& pCurrent->next_call_time <= g_current_time))
 		{
-			//fprintf(stderr, "exec task id=%d\n", pCurrent->id);
-			pCurrent->task_func(pCurrent->func_args);
+			//logInfo("exec task id: %d", pCurrent->id);
+            if (!pCurrent->new_thread)
+            {
+			    pCurrent->task_func(pCurrent->func_args);
+            }
+            else
+            {
+                pthread_t tid;
+                int result;
+
+                pCurrent->thread_running = false;
+                if ((result=pthread_create(&tid, NULL,
+                                sched_call_func, pCurrent)) != 0)
+                {
+                    logError("file: "__FILE__", line: %d, " \
+                            "create thread failed, " \
+                            "errno: %d, error info: %s", \
+                            __LINE__, result, STRERROR(result));
+                }
+                else
+                {
+                    usleep(1*1000);
+                    for (i=1; !pCurrent->thread_running && i<100; i++)
+                    {
+                        logDebug("file: "__FILE__", line: %d, "
+                                "task_id: %d, waiting thread ready, count %d",
+                                __LINE__, pCurrent->id, i);
+                        usleep(1*1000);
+                    }
+                }
+            }
+
             do
             {
                 pCurrent->next_call_time += pCurrent->interval;
@@ -499,8 +659,9 @@ int sched_del_entry(const int id)
 	return 0;
 }
 
-int sched_start(ScheduleArray *pScheduleArray, pthread_t *ptid, \
-		const int stack_size, bool * volatile pcontinue_flag)
+int sched_start_ex(ScheduleArray *pScheduleArray, pthread_t *ptid,
+		const int stack_size, bool * volatile pcontinue_flag,
+        ScheduleContext **ppContext)
 {
 	int result;
 	pthread_attr_t thread_attr;
@@ -517,6 +678,7 @@ int sched_start(ScheduleArray *pScheduleArray, pthread_t *ptid, \
 			result, STRERROR(result));
 		return result;
 	}
+    memset(pContext, 0, sizeof(ScheduleContext));
 
 	if ((result=init_pthread_attr(&thread_attr, stack_size)) != 0)
 	{
@@ -531,6 +693,30 @@ int sched_start(ScheduleArray *pScheduleArray, pthread_t *ptid, \
 		return result;
 	}
 
+    if (timer_slot_count > 0)
+    {
+        if ((result=fast_mblock_init(&pContext->mblock,
+                        sizeof(FastDelayTask), mblock_alloc_once)) != 0)
+        {
+	    	free(pContext);
+		    return result;
+        }
+
+        g_current_time = time(NULL);
+        if ((result=fast_timer_init(&pContext->timer, timer_slot_count,
+                        g_current_time)) != 0)
+    	{
+	    	free(pContext);
+		    return result;
+	    }
+        if ((result=init_pthread_lock(&pContext->delay_queue.lock)) != 0)
+        {
+	    	free(pContext);
+		    return result;
+        }
+        pContext->timer_init = true;
+    }
+
 	pContext->pcontinue_flag = pcontinue_flag;
 	if ((result=pthread_create(ptid, &thread_attr, \
 		sched_thread_entrance, pContext)) != 0)
@@ -542,7 +728,217 @@ int sched_start(ScheduleArray *pScheduleArray, pthread_t *ptid, \
 			__LINE__, result, STRERROR(result));
 	}
 
+    *ppContext = pContext;
 	pthread_attr_destroy(&thread_attr);
 	return result;
 }
 
+int sched_start(ScheduleArray *pScheduleArray, pthread_t *ptid,
+		const int stack_size, bool * volatile pcontinue_flag)
+{
+    return sched_start_ex(pScheduleArray, ptid, stack_size,
+            pcontinue_flag, &schedule_context);
+}
+
+void sched_set_delay_params(const int slot_count, const int alloc_once)
+{
+    if (slot_count > 1)
+    {
+        timer_slot_count = slot_count;
+    }
+    else
+    {
+        timer_slot_count = 300;
+    }
+
+    if (alloc_once > 0)
+    {
+        mblock_alloc_once = alloc_once;
+    }
+    else
+    {
+        mblock_alloc_once = 4 * 1024;
+    }
+}
+
+int sched_add_delay_task_ex(ScheduleContext *pContext, TaskFunc task_func,
+        void *func_args, const int delay_seconds, const bool new_thread)
+{
+    FastDelayTask *task;
+    if (!pContext->timer_init)
+    {
+		logError("file: "__FILE__", line: %d, "
+			"NOT support delay tasks, you should call sched_set_delay_params "
+            "before sched_start!", __LINE__);
+        return EOPNOTSUPP;
+    }
+
+    task = (FastDelayTask *)fast_mblock_alloc_object(&pContext->mblock);
+    if (task == NULL)
+    {
+        return ENOMEM;
+    }
+    task->task_func = task_func;
+    task->func_args = func_args;
+    task->new_thread = new_thread;
+    task->next = NULL;
+    if (delay_seconds > 0)
+    {
+        task->timer.expires = g_current_time + delay_seconds;
+    }
+    else
+    {
+        task->timer.expires = g_current_time;
+    }
+
+    pthread_mutex_lock(&pContext->delay_queue.lock);
+    if (pContext->delay_queue.head == NULL)
+    {
+        pContext->delay_queue.head = task;
+    }
+    else
+    {
+        pContext->delay_queue.tail->next = task;
+    }
+    pContext->delay_queue.tail = task;
+    pthread_mutex_unlock(&pContext->delay_queue.lock);
+
+    return 0;
+}
+
+int sched_add_delay_task(TaskFunc task_func, void *func_args,
+        const int delay_seconds, const bool new_thread)
+{
+    return sched_add_delay_task_ex(schedule_context, task_func,
+            func_args, delay_seconds, new_thread);
+}
+
+static void sched_deal_task_queue(ScheduleContext *pContext)
+{
+    FastDelayTask *task;
+
+    pthread_mutex_lock(&pContext->delay_queue.lock);
+    if (pContext->delay_queue.head == NULL)
+    {
+        pthread_mutex_unlock(&pContext->delay_queue.lock);
+        return;
+    }
+    task  = pContext->delay_queue.head;
+    pContext->delay_queue.head = NULL;
+    pContext->delay_queue.tail = NULL;
+    pthread_mutex_unlock(&pContext->delay_queue.lock);
+
+    while (task != NULL)
+    {
+        fast_timer_add(&pContext->timer, (FastTimerEntry *)task);
+        task = task->next;
+    }
+}
+
+struct delay_thread_context {
+    ScheduleContext *schedule_context;
+    FastDelayTask *task;
+};
+
+static void *sched_call_delay_func(void *args)
+{
+    struct delay_thread_context *delay_context;
+    ScheduleContext *pContext;
+    FastDelayTask *task;
+
+    delay_context = (struct delay_thread_context *)args;
+    task = delay_context->task;
+    pContext = delay_context->schedule_context;
+
+    logDebug("file: "__FILE__", line: %d, " \
+            "delay thread enter, task args: %p", __LINE__, task->func_args);
+
+    task->thread_running = true;
+    task->task_func(task->func_args);
+
+    logDebug("file: "__FILE__", line: %d, " \
+            "delay thread exit, task args: %p", __LINE__, task->func_args);
+
+    fast_mblock_free_object(&pContext->mblock, task);
+    pthread_detach(pthread_self());
+	return NULL;
+}
+
+static void deal_timeout_tasks(ScheduleContext *pContext, FastTimerEntry *head)
+{
+	FastTimerEntry *entry;
+	FastTimerEntry *current;
+    FastDelayTask *task;
+
+	entry = head->next;
+	while (entry != NULL)
+	{
+		current = entry;
+		entry = entry->next;
+
+        current->prev = current->next = NULL; //must set NULL because NOT in time wheel
+
+        task = (FastDelayTask *)current;
+
+        if (!task->new_thread)
+        {
+            task->task_func(task->func_args);
+            fast_mblock_free_object(&pContext->mblock, task);
+        }
+        else
+        {
+            struct delay_thread_context delay_context;
+            pthread_t tid;
+            int result;
+            int i;
+
+            task->thread_running = false;
+            delay_context.task = task;
+            delay_context.schedule_context = pContext;
+            if ((result=pthread_create(&tid, NULL,
+                            sched_call_delay_func, &delay_context)) != 0)
+            {
+                logError("file: "__FILE__", line: %d, " \
+                        "create thread failed, " \
+                        "errno: %d, error info: %s", \
+                        __LINE__, result, STRERROR(result));
+            }
+            else
+            {
+               usleep(1*1000);
+               for (i=1; !task->thread_running && i<100; i++)
+               {
+                   logDebug("file: "__FILE__", line: %d, "
+                           "task args: %p, waiting thread ready, count %d",
+                           __LINE__, task->func_args, i);
+                   usleep(1*1000);
+               }
+            }
+        }
+    }
+}
+
+static void sched_deal_delay_tasks(ScheduleContext *pContext)
+{
+	FastTimerEntry head;
+	int count;
+
+    if (!pContext->timer_init)
+    {
+        return;
+    }
+
+    sched_deal_task_queue(pContext);
+    count = fast_timer_timeouts_get(
+            &pContext->timer, g_current_time, &head);
+    if (count > 0)
+    {
+        deal_timeout_tasks(pContext, &head);
+        //logInfo("deal delay task count: %d", count);
+    }
+}
+
+uint32_t sched_generate_next_id()
+{
+    return ++next_id;
+}
